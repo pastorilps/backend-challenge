@@ -14,6 +14,7 @@ import {
 import { MikroOrmIdempotencyExecutor } from './mikro-orm-idempotency.executor.js';
 import { MikroOrmWagerTransactionProcessor } from './mikro-orm-wager-transaction.processor.js';
 import { OutboxMessageOrmEntity } from '../entities/outbox-message.orm-entity.js';
+import { InboxMessageOrmEntity } from '../entities/inbox-message.orm-entity.js';
 import { WagerTransactionOrmEntity } from '../entities/wager-transaction.orm-entity.js';
 import { WalletLedgerEntryOrmEntity } from '../entities/wallet-ledger-entry.orm-entity.js';
 import { WalletOrmEntity } from '../entities/wallet.orm-entity.js';
@@ -34,6 +35,7 @@ integration('PostgreSQL wager transaction concurrency', () => {
   const ormInstances: MikroORM[] = [];
   const useCases: ProcessWagerTransactionUseCase[] = [];
   const walletIds: string[] = [];
+  const inboxMessageIds: string[] = [];
 
   beforeAll(async () => {
     for (let index = 0; index < 3; index += 1) {
@@ -61,6 +63,11 @@ integration('PostgreSQL wager transaction concurrency', () => {
     try {
       if (ormInstances.length > 0 && walletIds.length > 0) {
         const em = ormInstances[0].em.fork();
+        if (inboxMessageIds.length > 0) {
+          await em.nativeDelete(InboxMessageOrmEntity, {
+            messageId: { $in: inboxMessageIds },
+          });
+        }
         const transactions = await em.find(WagerTransactionOrmEntity, {
           wallet: { $in: walletIds },
         });
@@ -128,10 +135,23 @@ integration('PostgreSQL wager transaction concurrency', () => {
       .findOneOrFail(WalletOrmEntity, { id: walletId });
     payload.playerId = wallet.playerId;
     const key = `parallel-${randomUUID()}`;
+    const messageId = `message-${randomUUID()}`;
+    inboxMessageIds.push(messageId);
+    const inboxReceipt = {
+      consumerName: 'concurrency-integration-test',
+      messageId,
+      payloadHash: 'a'.repeat(64),
+      payloadJson: { messageId, type: 'WagerTransactionRequested' },
+      attempts: 1,
+    };
 
     const results = await Promise.all(
       Array.from({ length: 50 }, (_, index) =>
-        useCases[index % useCases.length].execute(payload, key),
+        useCases[index % useCases.length].execute(
+          payload,
+          key,
+          inboxReceipt,
+        ),
       ),
     );
     const persistedWallet = await ormInstances[0].em
@@ -140,6 +160,13 @@ integration('PostgreSQL wager transaction concurrency', () => {
     const entryCount = await ormInstances[0].em
       .fork()
       .count(WalletLedgerEntryOrmEntity, { wallet: walletId });
+    const inboxCount = await ormInstances[0].em
+      .fork()
+      .count(InboxMessageOrmEntity, {
+        consumerName: inboxReceipt.consumerName,
+        messageId,
+        status: 'PROCESSED',
+      });
 
     expect(
       results.filter((result) => result.response.idempotentReplay === false),
@@ -149,6 +176,79 @@ integration('PostgreSQL wager transaction concurrency', () => {
     ).toHaveLength(49);
     expect(persistedWallet.balanceAmount).toBe('99.00');
     expect(entryCount).toBe(1);
+    expect(inboxCount).toBe(1);
+  }, 30_000);
+
+  it('persists terminal business failures in the inbox after rolling back finance', async () => {
+    const walletId = await createWallet('100.00');
+    const wallet = await ormInstances[0].em
+      .fork()
+      .findOneOrFail(WalletOrmEntity, { id: walletId });
+    const externalTransactionId = `duplicate-${randomUUID()}`;
+    await useCases[0].execute(
+      {
+        ...request(walletId, externalTransactionId, '10.00'),
+        playerId: wallet.playerId,
+      },
+      `first-key-${randomUUID()}`,
+    );
+
+    const messageId = `terminal-${randomUUID()}`;
+    inboxMessageIds.push(messageId);
+    const inboxReceipt = {
+      consumerName: 'concurrency-terminal-test',
+      messageId,
+      payloadHash: 'b'.repeat(64),
+      payloadJson: { messageId, type: 'WagerTransactionRequested' },
+      attempts: 1,
+    };
+    const duplicateOperation = {
+      ...request(walletId, externalTransactionId, '10.00'),
+      playerId: wallet.playerId,
+    };
+    const idempotencyKey = `duplicate-key-${randomUUID()}`;
+
+    await expect(
+      useCases[1].execute(
+        duplicateOperation,
+        idempotencyKey,
+        inboxReceipt,
+      ),
+    ).rejects.toMatchObject({
+      code: 'DUPLICATE_EXTERNAL_TRANSACTION',
+      statusCode: 409,
+    });
+    await expect(
+      useCases[2].execute(
+        duplicateOperation,
+        idempotencyKey,
+        inboxReceipt,
+      ),
+    ).rejects.toMatchObject({
+      code: 'INBOX_MESSAGE_ALREADY_PROCESSED',
+      statusCode: 409,
+    });
+
+    const persistedInboxMessage = await ormInstances[0].em
+      .fork()
+      .findOneOrFail(InboxMessageOrmEntity, {
+        consumerName: inboxReceipt.consumerName,
+        messageId,
+      });
+    const persistedWallet = await ormInstances[0].em
+      .fork()
+      .findOneOrFail(WalletOrmEntity, { id: walletId });
+    const transactionCount = await ormInstances[0].em
+      .fork()
+      .count(WagerTransactionOrmEntity, {
+        providerId: duplicateOperation.providerId,
+        externalTransactionId,
+      });
+
+    expect(persistedInboxMessage.status).toBe('FAILED');
+    expect(persistedInboxMessage.processedAt).toBeInstanceOf(Date);
+    expect(persistedWallet.balanceAmount).toBe('90.00');
+    expect(transactionCount).toBe(1);
   }, 30_000);
 
   it('allows only one of two concurrent 80.00 bets against a 100.00 wallet', async () => {

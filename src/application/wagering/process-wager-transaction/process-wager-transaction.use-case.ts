@@ -4,6 +4,7 @@ import { hashPayload } from '../../../shared/utils/hash-payload.js';
 import {
   IdempotentExecutionResult,
   ProcessWagerTransactionInput,
+  WagerTransactionInboxReceipt,
   WagerTransactionIdempotencyExecutor,
 } from './idempotency.types.js';
 import { WagerTransactionProcessor } from './wager-transaction-processor.js';
@@ -17,6 +18,7 @@ export class ProcessWagerTransactionUseCase {
   execute(
     input: ProcessWagerTransactionInput,
     idempotencyKeyValue: string,
+    inboxReceipt?: WagerTransactionInboxReceipt,
   ): Promise<IdempotentExecutionResult> {
     const idempotencyKey = IdempotencyKey.from(idempotencyKeyValue);
     const money = Money.from(input.money).toJSON();
@@ -47,6 +49,7 @@ export class ProcessWagerTransactionUseCase {
           payloadHash,
           transactionManager,
         ),
+      inboxReceipt,
     );
   }
 }

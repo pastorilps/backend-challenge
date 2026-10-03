@@ -3,6 +3,7 @@ import { WagerTransactionKind } from '../../../domain/wagering/enums/wager-trans
 import { WagerTransactionStatus } from '../../../domain/wagering/enums/wager-transaction-status.js';
 import {
   IdempotentExecutionResult,
+  WagerTransactionInboxReceipt,
   WagerTransactionIdempotencyExecutor,
   WagerTransactionOperation,
 } from './idempotency.types.js';
@@ -14,14 +15,21 @@ class TestIdempotencyExecutor extends WagerTransactionIdempotencyExecutor {
     key: string;
     hash: string;
     operation: WagerTransactionOperation;
+    inboxReceipt?: WagerTransactionInboxReceipt;
   };
 
   override execute(
     idempotencyKey: string,
     payloadHash: string,
     operation: WagerTransactionOperation,
+    inboxReceipt?: WagerTransactionInboxReceipt,
   ): Promise<IdempotentExecutionResult> {
-    this.received = { key: idempotencyKey, hash: payloadHash, operation };
+    this.received = {
+      key: idempotencyKey,
+      hash: payloadHash,
+      operation,
+      inboxReceipt,
+    };
     return Promise.resolve({
       response: {
         transactionId: 'transaction-1',
@@ -89,5 +97,37 @@ describe('ProcessWagerTransactionUseCase idempotency input', () => {
       ),
     ).toThrow();
     expect(executor.received).toBeUndefined();
+  });
+
+  it('forwards an SQS inbox receipt to the transaction executor', async () => {
+    const executor = new TestIdempotencyExecutor();
+    const useCase = new ProcessWagerTransactionUseCase(
+      executor,
+      new TestProcessor(),
+    );
+    const inboxReceipt: WagerTransactionInboxReceipt = {
+      consumerName: 'wager-transaction-consumer',
+      messageId: 'message-1',
+      payloadHash: 'a'.repeat(64),
+      payloadJson: { messageId: 'message-1' },
+      attempts: 1,
+    };
+
+    await useCase.execute(
+      {
+        providerId: 'provider-1',
+        externalTransactionId: 'external-1',
+        playerId: 'player-1',
+        walletId: 'wallet-1',
+        roundId: 'round-1',
+        gameId: 'game-1',
+        kind: WagerTransactionKind.Bet,
+        money: { amount: '25.00', currency: 'BRL' },
+      },
+      'provider-1:external-1',
+      inboxReceipt,
+    );
+
+    expect(executor.received?.inboxReceipt).toEqual(inboxReceipt);
   });
 });

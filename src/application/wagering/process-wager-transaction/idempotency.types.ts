@@ -36,6 +36,14 @@ export interface IdempotentExecutionResult {
   replayed: boolean;
 }
 
+export interface WagerTransactionInboxReceipt {
+  consumerName: string;
+  messageId: string;
+  payloadHash: string;
+  payloadJson: Readonly<Record<string, unknown>>;
+  attempts: number;
+}
+
 export type WagerTransactionOperation = (
   transactionManager: EntityManager,
 ) => Promise<IdempotentOperationResult>;
@@ -45,5 +53,6 @@ export abstract class WagerTransactionIdempotencyExecutor {
     idempotencyKey: string,
     payloadHash: string,
     operation: WagerTransactionOperation,
+    inboxReceipt?: WagerTransactionInboxReceipt,
   ): Promise<IdempotentExecutionResult>;
 }

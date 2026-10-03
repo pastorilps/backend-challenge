@@ -18,12 +18,22 @@ import { WageringController } from './presentation/http/wagering/wagering.contro
 import { WalletsController } from './presentation/http/wallets/wallets.controller.js';
 import { ProviderIdentityGuard } from './presentation/http/auth/provider-identity.guard.js';
 import { AppMetrics } from './infrastructure/observability/metrics/app-metrics.js';
+import {
+  SQS_QUEUE_CLIENT,
+  SqsModule,
+} from './infrastructure/messaging/sqs/sqs.module.js';
+import { SqsQueueClient } from './infrastructure/messaging/sqs/sqs-queue-client.js';
+import {
+  loadWagerTransactionSqsConsumerConfig,
+  WagerTransactionSqsConsumer,
+} from './infrastructure/messaging/sqs/consumers/wager-transaction.consumer.js';
 
 export const { ObserveModule, ObserveInstrument } = createObserveModule();
 
 @Module({
   imports: [
     DatabaseModule,
+    SqsModule,
     // Distributed tracing, auto-correlated logs, request/job metrics, error
     // telemetry, alarms, and more — out of the box. Sign up at https://observe.nestjs.com
     ObserveModule.forRoot({
@@ -74,6 +84,19 @@ export const { ObserveModule, ObserveInstrument } = createObserveModule();
           new MikroOrmWagerTransactionProcessor(),
         ),
       inject: [DATABASE_ORM],
+    },
+    {
+      provide: WagerTransactionSqsConsumer,
+      useFactory: (
+        queueClient: SqsQueueClient,
+        processWagerTransaction: ProcessWagerTransactionUseCase,
+      ) =>
+        new WagerTransactionSqsConsumer(
+          queueClient,
+          processWagerTransaction,
+          loadWagerTransactionSqsConsumerConfig(),
+        ),
+      inject: [SQS_QUEUE_CLIENT, ProcessWagerTransactionUseCase],
     },
   ],
 })

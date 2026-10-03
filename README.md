@@ -33,15 +33,45 @@ $ npm install
 
 ## HTTP API
 
-Configure `DATABASE_URL` for PostgreSQL and apply the MikroORM migrations before starting the service. The API includes wallet creation and queries, paginated wallet ledger, reconciliation, wager submission/queries, and health checks.
+Copy `.env.example` to `.env`, start the local dependencies with `docker compose up -d`, and apply the MikroORM migrations before starting the service. The Nest application loads `.env` automatically. The API includes wallet creation and queries, paginated wallet ledger, reconciliation, wager submission/queries, and health checks.
 
 - Swagger UI: `http://localhost:3000/docs`
 - OpenAPI JSON: `http://localhost:3000/docs-json`
 - `GET /health/live` checks process liveness and is always public.
-- `GET /health/ready` checks PostgreSQL and the configured SQS health endpoint. Set `SQS_HEALTHCHECK_URL` to an HTTP health endpoint for SQS/LocalStack; readiness returns `503` until both dependencies are reachable.
+- `GET /health/ready` checks PostgreSQL and MiniStack via `SQS_HEALTHCHECK_URL`; readiness returns `503` until both dependencies are reachable.
 - `POST /wagering/transactions` requires an `Idempotency-Key` header.
 
 Provider authentication is intentionally not implemented for this challenge. The provider identity guard is a no-op extension point and must be replaced with OIDC authentication before exposing business endpoints in production.
+
+## SQS wager consumer
+
+The worker consumes `WagerTransactionRequested` messages from the FIFO source queue and uses the same wager use case as the HTTP API. `docker compose up -d` starts MiniStack and a one-shot initializer that creates the source queue and FIFO DLQ with the required redrive policy. The default configuration is:
+
+```text
+SQS_QUEUE_URL=http://localhost:4566/000000000000/wager-transactions.fifo
+SQS_DLQ_URL=http://localhost:4566/000000000000/wager-transactions-dlq.fifo
+SQS_ENDPOINT_URL=http://localhost:4566
+AWS_REGION=us-east-1
+SQS_HEALTHCHECK_URL=http://localhost:4566/_ministack/health
+```
+
+On Windows PowerShell, start the dependencies and the application with:
+
+```powershell
+Copy-Item .env.example .env
+docker compose up -d
+npm run start:dev
+```
+
+Compose reads `.env` automatically; the Nest application loads the same file through `dotenv`. The AWS SDK uses its normal credential provider chain. The example uses MiniStack's local test credentials (`test`/`test`), which must not be reused in AWS. If both queue URLs are omitted, the HTTP service starts with the consumer disabled; setting only one is a startup configuration error.
+
+The queue initializer runs once after MiniStack reports healthy. If queues need to be recreated after resetting MiniStack, run `docker compose run --rm sqs-init`. Queue names and retry count can be overridden with `SQS_QUEUE_NAME`, `SQS_DLQ_NAME`, and `SQS_MAX_ATTEMPTS` in `.env`.
+
+The sample endpoint and queue URLs target an application running on the host. If the application is later run inside `app_network`, use `SQS_ENDPOINT_URL=http://ministack:4566`, `SQS_QUEUE_URL=http://ministack:4566/000000000000/wager-transactions.fifo`, `SQS_DLQ_URL=http://ministack:4566/000000000000/wager-transactions-dlq.fifo`, and `SQS_HEALTHCHECK_URL=http://ministack:4566/_ministack/health`.
+
+The message body follows section 10 of `PLAN.md`; its `data` also includes `idempotencyKey`. Business validation errors are terminal and acknowledged after being persisted in the inbox. Invalid or conflicting message IDs go to the configured FIFO DLQ. Other failures are retried with exponential visibility backoff and sent to the DLQ after `SQS_MAX_ATTEMPTS` (default `5`).
+
+Optional tuning variables are `SQS_CONSUMER_NAME` (default `wager-transaction-consumer`), `SQS_MAX_ATTEMPTS`, `SQS_RETRY_BASE_DELAY_MS` (default `1000`), `SQS_RETRY_MAX_DELAY_MS` (default `300000`), `SQS_VISIBILITY_TIMEOUT_SECONDS` (default `60`), and `SQS_WAIT_TIME_SECONDS` (default `20`). On shutdown the worker stops polling, cancels the long poll, and waits for the current message handler to finish.
 
 ## Compile and run the project
 
