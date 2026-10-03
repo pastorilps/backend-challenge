@@ -31,6 +31,18 @@
 $ npm install
 ```
 
+## HTTP API
+
+Configure `DATABASE_URL` for PostgreSQL and apply the MikroORM migrations before starting the service. The API includes wallet creation and queries, paginated wallet ledger, reconciliation, wager submission/queries, and health checks.
+
+- Swagger UI: `http://localhost:3000/docs`
+- OpenAPI JSON: `http://localhost:3000/docs-json`
+- `GET /health/live` checks process liveness and is always public.
+- `GET /health/ready` checks PostgreSQL and the configured SQS health endpoint. Set `SQS_HEALTHCHECK_URL` to an HTTP health endpoint for SQS/LocalStack; readiness returns `503` until both dependencies are reachable.
+- `POST /wagering/transactions` requires an `Idempotency-Key` header.
+
+Provider authentication is intentionally not implemented for this challenge. The provider identity guard is a no-op extension point and must be replaced with OIDC authentication before exposing business endpoints in production.
+
 ## Compile and run the project
 
 ```bash

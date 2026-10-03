@@ -1,12 +1,13 @@
 import { NestFactory } from '@nestjs/core';
 import { AppModule, ObserveInstrument } from './app.module.js';
-import { AppErrorFilter } from './presentation/http/filters/app-error.filter.js';
+import { configureHttpApplication } from './presentation/http/configure-http-application.js';
 
 async function bootstrap() {
   const app = await NestFactory.create(AppModule, {
     instrument: ObserveInstrument,
   });
-  app.useGlobalFilters(new AppErrorFilter());
+  configureHttpApplication(app);
+  app.enableShutdownHooks();
   await app.listen(process.env.PORT ?? 3000);
 }
 await bootstrap();
