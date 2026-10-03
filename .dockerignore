@@ -1,0 +1,12 @@
+.git
+.github
+.vscode
+.env
+.env.*
+!.env.example
+node_modules
+dist
+coverage
+test-results
+*.log
+tsconfig.build.tsbuildinfo

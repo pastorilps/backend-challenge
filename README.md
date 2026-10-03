@@ -1,180 +1,240 @@
-<p align="center">
-  <a href="http://nestjs.com/" target="blank"><img src="https://nestjs.com/img/logo-small.svg" width="120" alt="Nest Logo" /></a>
-</p>
+# Processador distribuído de transações de apostas
 
-[circleci-image]: https://img.shields.io/circleci/build/github/nestjs/nest/master?token=abc123def456
-[circleci-url]: https://circleci.com/gh/nestjs/nest
+Backend NestJS para processamento de operações de carteira e transações de apostas. O sistema prioriza consistência financeira, idempotência persistente, concorrência entre instâncias e recuperação de mensagens usando PostgreSQL, MikroORM e SQS (MiniStack no ambiente local).
 
-  <p align="center">A progressive <a href="http://nodejs.org" target="_blank">Node.js</a> framework for building efficient and scalable server-side applications.</p>
-    <p align="center">
-<a href="https://www.npmjs.com/~nestjscore" target="_blank"><img src="https://img.shields.io/npm/v/@nestjs/core.svg" alt="NPM Version" /></a>
-<a href="https://www.npmjs.com/~nestjscore" target="_blank"><img src="https://img.shields.io/npm/l/@nestjs/core.svg" alt="Package License" /></a>
-<a href="https://www.npmjs.com/~nestjscore" target="_blank"><img src="https://img.shields.io/npm/dm/@nestjs/common.svg" alt="NPM Downloads" /></a>
-<a href="https://circleci.com/gh/nestjs/nest" target="_blank"><img src="https://img.shields.io/circleci/build/github/nestjs/nest/master" alt="CircleCI" /></a>
-<a href="https://discord.gg/G7Qnnhy" target="_blank"><img src="https://img.shields.io/badge/discord-online-brightgreen.svg" alt="Discord"/></a>
-<a href="https://opencollective.com/nest#backer" target="_blank"><img src="https://opencollective.com/nest/backers/badge.svg" alt="Backers on Open Collective" /></a>
-<a href="https://opencollective.com/nest#sponsor" target="_blank"><img src="https://opencollective.com/nest/sponsors/badge.svg" alt="Sponsors on Open Collective" /></a>
-  <a href="https://paypal.me/kamilmysliwiec" target="_blank"><img src="https://img.shields.io/badge/Donate-PayPal-ff3f59.svg" alt="Donate us"/></a>
-    <a href="https://opencollective.com/nest#sponsor"  target="_blank"><img src="https://img.shields.io/badge/Support%20us-Open%20Collective-41B883.svg" alt="Support us"></a>
-  <a href="https://twitter.com/nestframework" target="_blank"><img src="https://img.shields.io/twitter/follow/nestframework.svg?style=social&label=Follow" alt="Follow us on Twitter"></a>
-</p>
-  <!--[![Backers on Open Collective](https://opencollective.com/nest/backers/badge.svg)](https://opencollective.com/nest#backer)
-  [![Sponsors on Open Collective](https://opencollective.com/nest/sponsors/badge.svg)](https://opencollective.com/nest#sponsor)-->
+## Sumário
 
-## Description
+- [Arquitetura e fluxo](#arquitetura-e-fluxo)
+- [Domínio e garantias](#domínio-e-garantias)
+- [API HTTP](#api-http)
+- [Processamento SQS e transactional outbox](#processamento-sqs-e-transactional-outbox)
+- [Persistência e migrations](#persistência-e-migrations)
+- [Executar localmente](#executar-localmente)
+- [Testes](#testes)
+- [Observabilidade e health checks](#observabilidade-e-health-checks)
+- [Aderência à arquitetura e limitações conhecidas](#aderência-à-arquitetura-e-limitações-conhecidas)
 
-[Nest](https://github.com/nestjs/nest) framework TypeScript starter repository.
+## Arquitetura e fluxo
 
-## Project setup
+O código segue a separação descrita em [ARCHITECTURE.md](./ARCHITECTURE.md):
 
-```bash
-$ npm install
+| Camada         | Responsabilidade                                                                                   | Localização              |
+| -------------- | -------------------------------------------------------------------------------------------------- | ------------------------ |
+| Domínio        | Dinheiro, carteira, transação, ledger, inbox e outbox; invariantes independentes de infraestrutura | `src/domain/`            |
+| Aplicação      | Casos de uso, processamento de transação e contrato de métricas                                    | `src/application/`       |
+| Infraestrutura | PostgreSQL/MikroORM, migrations, SQS, publisher e métricas                                         | `src/infrastructure/`    |
+| Apresentação   | Controllers HTTP, DTOs, validação, Swagger e health checks                                         | `src/presentation/http/` |
+| Compartilhado  | Erros, eventos de integração, hash e JSON canônico                                                 | `src/shared/`            |
+
+HTTP e SQS reutilizam o mesmo `ProcessWagerTransactionUseCase`. Para cada operação financeira, o processador persiste em uma única transação PostgreSQL o estado da carteira, a transação, o lançamento no ledger, o receipt do inbox (quando originado da fila) e os eventos da outbox. Os eventos só são publicados pelo worker após o commit.
+
+## Domínio e garantias
+
+- O valor monetário trafega como decimal em string e é armazenado em `numeric(19,2)`. A moeda suportada para carteiras e ledger é BRL; rejeições de moeda podem ser auditadas na transação.
+- Wallets são limitadas a uma por jogador/moeda. Um saldo inicial positivo cria uma transação `OPENING` e um crédito no ledger junto da wallet; saldo inicial zero não cria lançamento.
+- `BET` debita; `WIN` credita; `LOSS` não altera saldo; `REFUND` e `ROLLBACK` dependem de uma transação de referência válida e não podem reverter a mesma referência mais de uma vez.
+- A wallet é bloqueada com `SELECT ... FOR UPDATE` antes de validar/aplicar mudanças. Locks advisory transacionais serializam chaves de idempotência e identificadores externos; constraints únicas no PostgreSQL são a última defesa.
+- O ledger registra o saldo antes/depois e não deve ser alterado pela aplicação depois da criação. Reconciliação compara o saldo materializado com a soma do ledger, registra divergências e não corrige automaticamente.
+- `Idempotency-Key` e hash do payload são persistidos. Repetir a mesma chave e payload devolve a resposta original; reutilizar a chave com conteúdo diferente é conflito.
+- Mensagens SQS têm entrega at-least-once. O inbox deduplica por consumidor e `messageId`; uma mensagem já processada não repete efeitos financeiros.
+- Retries da outbox mantêm o `eventId` estável. Uma falha após o aceite pelo SQS e antes do commit pode duplicar a publicação; consumidores de eventos devem deduplicar pelo `eventId`.
+
+## API HTTP
+
+Swagger UI: `GET /docs`
+
+Documento OpenAPI: `GET /docs-json`
+
+| Método e rota                                                             | Uso                                                                     |
+| ------------------------------------------------------------------------- | ----------------------------------------------------------------------- |
+| `POST /wallets`                                                           | Cria wallet e, se houver saldo inicial positivo, o lançamento `OPENING` |
+| `GET /wallets/:walletId`                                                  | Consulta saldo atual                                                    |
+| `GET /wallets/:walletId/ledger?limit=&cursor=`                            | Consulta ledger paginado com cursor opaco                               |
+| `POST /wallets/:walletId/reconciliation`                                  | Recalcula saldo usando o ledger e retorna divergências                  |
+| `POST /wagering/transactions`                                             | Processa aposta/operação; exige `Idempotency-Key`                       |
+| `GET /wagering/transactions/:transactionId`                               | Consulta pelo UUID interno                                              |
+| `GET /providers/:providerId/wagering/transactions/:externalTransactionId` | Consulta pelo identificador externo do provedor                         |
+| `GET /health/live`                                                        | Liveness do processo                                                    |
+| `GET /health/ready`                                                       | Readiness de PostgreSQL e SQS/MiniStack                                 |
+
+O envio de transação responde `200` para processamento/replay, `202` quando aguarda referência, `422` para rejeição de negócio e erros estruturados para conflitos/entradas inválidas. Falhas transitórias do banco são reportadas como indisponibilidade.
+
+**Autenticação:** não foi implementada para este desafio. `ProviderIdentityGuard` é apenas um ponto de extensão no-op, não controle de acesso. Não exponha endpoints de negócio publicamente antes de substituí-lo por autenticação/autorização adequada (por exemplo, OIDC).
+
+## Processamento SQS e transactional outbox
+
+O consumer recebe `WagerTransactionRequested`, valida o envelope, grava/processa via inbox e só então confirma a mensagem original. Erros de negócio terminais são persistidos no inbox e confirmados; mensagens malformadas/conflitantes vão para DLQ; falhas transitórias recebem visibility timeout exponencial e são enviadas à DLQ ao atingir `SQS_MAX_ATTEMPTS`. No encerramento, o consumer interrompe o long polling e aguarda o handler ativo.
+
+O publisher busca outbox pendente com `FOR UPDATE SKIP LOCKED`, publica em fila FIFO usando o agregado como `MessageGroupId` e o `eventId` como deduplication ID, e marca publicação. Falhas mantêm a linha pendente com tentativas e próximo horário de retry.
+
+O Compose inicializa três filas FIFO no MiniStack:
+
+- `wager-transactions.fifo` — entrada de transações;
+- `wager-transactions-dlq.fifo` — dead-letter queue;
+- `wager-events.fifo` — eventos de integração da outbox.
+
+## Persistência e migrations
+
+O schema MikroORM define `wallets`, `wager_transactions`, `wallet_ledger_entries`, `inbox_messages` e `outbox_messages`, seus relacionamentos, checks, índices e constraints. As migrations versionadas estão em `src/infrastructure/database/mikro-orm/migrations/`.
+
+Ao iniciar, o container aplica migrations pendentes automaticamente. Em um banco vazio, cria o schema atual pelo MikroORM e registra o baseline correspondente às migrations existentes. Se houver um schema parcial, o startup falha explicitamente em vez de tentar repará-lo silenciosamente.
+
+Para inicializar manualmente um banco com a imagem já construída:
+
+```powershell
+docker compose run --rm app npm run db:initialize
 ```
 
-## HTTP API
+`npm run migration:up` continua disponível para executar migrations versionadas manualmente em ambientes com configuração TypeScript e conexão de banco.
 
-Copy `.env.example` to `.env`, start the local dependencies with `docker compose up -d`, and apply the MikroORM migrations before starting the service. The Nest application loads `.env` automatically. The API includes wallet creation and queries, paginated wallet ledger, reconciliation, wager submission/queries, and health checks.
+## Executar localmente
 
-- Swagger UI: `http://localhost:3000/docs`
-- OpenAPI JSON: `http://localhost:3000/docs-json`
-- `GET /health/live` checks process liveness and is always public.
-- `GET /health/ready` checks PostgreSQL and MiniStack via `SQS_HEALTHCHECK_URL`; readiness returns `503` until both dependencies are reachable.
-- `POST /wagering/transactions` requires an `Idempotency-Key` header.
-
-Provider authentication is intentionally not implemented for this challenge. The provider identity guard is a no-op extension point and must be replaced with OIDC authentication before exposing business endpoints in production.
-
-## SQS wager consumer
-
-The worker consumes `WagerTransactionRequested` messages from the FIFO source queue and uses the same wager use case as the HTTP API. `docker compose up -d` starts MiniStack and a one-shot initializer that creates the source queue, FIFO DLQ, and the FIFO integration-events queue used by the transactional outbox. The default configuration is:
-
-```text
-SQS_QUEUE_URL=http://localhost:4566/000000000000/wager-transactions.fifo
-SQS_DLQ_URL=http://localhost:4566/000000000000/wager-transactions-dlq.fifo
-SQS_EVENTS_QUEUE_URL=http://localhost:4566/000000000000/wager-events.fifo
-SQS_ENDPOINT_URL=http://localhost:4566
-AWS_REGION=us-east-1
-SQS_HEALTHCHECK_URL=http://localhost:4566/_ministack/health
-```
-
-On Windows PowerShell, start the dependencies and the application with:
+Pré-requisitos: Docker Desktop (ou Docker Engine) com Docker Compose v2.
 
 ```powershell
 Copy-Item .env.example .env
-docker compose up -d
-npm run start:dev
+docker compose up --build -d
 ```
 
-Compose reads `.env` automatically; the Nest application loads the same file through `dotenv`. The AWS SDK uses its normal credential provider chain. The example uses MiniStack's local test credentials (`test`/`test`), which must not be reused in AWS. If both queue URLs are omitted, the HTTP service starts with the consumer disabled; setting only one is a startup configuration error.
+O Compose constrói e executa a API/worker no container `app`, inicia PostgreSQL e MiniStack, espera pelos health checks, cria as filas SQS e só então inicia a aplicação. Na primeira inicialização a aplicação cria o schema do banco; nos próximos starts aplica migrations pendentes antes de servir tráfego.
 
-The queue initializer runs once after MiniStack reports healthy. If queues need to be recreated after resetting MiniStack, run `docker compose run --rm sqs-init`. Queue names and retry count can be overridden with `SQS_QUEUE_NAME`, `SQS_DLQ_NAME`, `SQS_EVENTS_QUEUE_NAME`, and `SQS_MAX_ATTEMPTS` in `.env`.
+- API: `http://localhost:3000`
+- Swagger: `http://localhost:3000/docs`
+- PostgreSQL: `localhost:5432`
+- MiniStack SQS: `localhost:4566`
 
-The sample endpoint and queue URLs target an application running on the host. If the application is later run inside `app_network`, use `SQS_ENDPOINT_URL=http://ministack:4566`, `SQS_QUEUE_URL=http://ministack:4566/000000000000/wager-transactions.fifo`, `SQS_DLQ_URL=http://ministack:4566/000000000000/wager-transactions-dlq.fifo`, `SQS_EVENTS_QUEUE_URL=http://ministack:4566/000000000000/wager-events.fifo`, and `SQS_HEALTHCHECK_URL=http://ministack:4566/_ministack/health`.
+Confira o estado e os logs:
 
-The message body follows section 10 of `PLAN.md`; its `data` also includes `idempotencyKey`. Business validation errors are terminal and acknowledged after being persisted in the inbox. Invalid or conflicting message IDs go to the configured FIFO DLQ. Other failures are retried with exponential visibility backoff and sent to the DLQ after `SQS_MAX_ATTEMPTS` (default `5`).
-
-Optional tuning variables are `SQS_CONSUMER_NAME` (default `wager-transaction-consumer`), `SQS_MAX_ATTEMPTS`, `SQS_RETRY_BASE_DELAY_MS` (default `1000`), `SQS_RETRY_MAX_DELAY_MS` (default `300000`), `SQS_VISIBILITY_TIMEOUT_SECONDS` (default `60`), and `SQS_WAIT_TIME_SECONDS` (default `20`). On shutdown the worker stops polling, cancels the long poll, and waits for the current message handler to finish.
-
-## Transactional outbox
-
-The outbox publisher sends committed integration events to `SQS_EVENTS_QUEUE_URL`. It claims due rows in PostgreSQL using `FOR UPDATE SKIP LOCKED`, publishes them to the FIFO queue with `aggregateId` as the message group and the stable `eventId` as the deduplication ID, then marks them `PUBLISHED` in the same SQL transaction. Concurrent app instances claim separate rows. If publishing fails, the row stays pending and `attempts`/`nextAttemptAt` are updated with exponential backoff; after a process crash, uncommitted row locks are released and another instance can claim the event.
-
-SQS delivery is at-least-once: a process/database failure after SQS accepts an event but before PostgreSQL commits can cause a duplicate publish. Consumers must deduplicate by the stable envelope `eventId`; FIFO deduplication is an additional short-window safeguard, not the correctness guarantee. Configure `OUTBOX_BATCH_SIZE` (default `10`) and `OUTBOX_POLL_INTERVAL_MS` (default `1000`). The publisher starts only when `SQS_EVENTS_QUEUE_URL` is configured, so outbox rows remain persisted and pending otherwise.
-
-## Compile and run the project
-
-```bash
-# development
-$ npm run start
-
-# watch mode
-$ npm run start:dev
-
-# production mode
-$ npm run start:prod
+```powershell
+docker compose ps
+docker compose logs -f app
 ```
 
-## Run tests
+Para parar os containers mantendo os dados do PostgreSQL:
 
-```bash
-# unit tests
-$ npm run test
-
-# e2e tests
-$ npm run test:e2e
-
-# test coverage
-$ npm run test:cov
+```powershell
+docker compose down
 ```
 
-## Deployment
+Para apagar também o volume persistente do banco (ação destrutiva, remove os dados locais):
 
-When you're ready to deploy your NestJS application to production, there are some key steps you can take to ensure it runs as efficiently as possible. Check out the [deployment documentation](https://docs.nestjs.com/deployment) for more information.
-
-If you are looking for a cloud-based platform to deploy your NestJS application, check out [Mau](https://mau.nestjs.com), our official platform for deploying NestJS applications on AWS. Mau makes deployment straightforward and fast, requiring just a few simple steps:
-
-```bash
-$ npm install -g @nestjs/mau
-$ mau deploy
+```powershell
+docker compose down --volumes
 ```
 
-With Mau, you can deploy your application in just a few clicks, allowing you to focus on building features rather than managing infrastructure.
+O Compose inicializa o serviço `sqs-init` após o health check do MiniStack. Para reinicializar as filas após limpar o emulador, execute:
 
-## Observability
+```powershell
+docker compose run --rm sqs-init
+```
 
-In production applications, observability is essential for understanding how your system behaves, detecting issues early, and maintaining reliable performance.
+Configuração local relevante:
 
-[NestJS Observe](https://observe.nestjs.com) automatically instruments your NestJS application, giving you deep visibility into your system with minimal setup:
+| Variável                                                    | Finalidade                                                          |
+| ----------------------------------------------------------- | ------------------------------------------------------------------- |
+| `POSTGRES_USER` / `POSTGRES_PASSWORD` / `POSTGRES_DB`       | Usuário, senha e banco criados pelo container PostgreSQL            |
+| `POSTGRES_PORT`                                             | Porta publicada do PostgreSQL no host (padrão `5432`)               |
+| `APP_PORT`                                                  | Porta HTTP publicada no host (padrão `3000`)                        |
+| `MINISTACK_PORT`                                            | Porta SQS publicada no host (padrão `4566`)                         |
+| `DATABASE_URL`                                              | URL de conexão interna; no Compose o hostname do banco é `postgres` |
+| `SQS_ENDPOINT_URL`                                          | Endpoint interno do emulador (`http://ministack:4566`)              |
+| `SQS_QUEUE_NAME` / `SQS_DLQ_NAME` / `SQS_EVENTS_QUEUE_NAME` | Nomes das filas FIFO inicializadas pelo Compose                     |
+| `AWS_REGION` / `AWS_ACCOUNT_ID`                             | Região e account id usados pelo MiniStack                           |
+| `SQS_MAX_ATTEMPTS`                                          | Tentativas de processamento antes de DLQ (padrão `5`)               |
+| `SQS_RETRY_BASE_DELAY_MS` / `SQS_RETRY_MAX_DELAY_MS`        | Limites do backoff de retry                                         |
+| `SQS_VISIBILITY_TIMEOUT_SECONDS` / `SQS_WAIT_TIME_SECONDS`  | Visibilidade e long polling                                         |
+| `OUTBOX_BATCH_SIZE` / `OUTBOX_POLL_INTERVAL_MS`             | Lote e intervalo do publisher                                       |
 
-- **Distributed tracing:** Follow requests across services and understand how they flow through your system.
-- **Waterfall analysis:** Visualize request execution and identify slow operations, bottlenecks, and unexpected delays.
-- **Performance analysis:** Analyze application performance in real time and quickly pinpoint areas that need optimization.
-- **Metrics:** Track key application and infrastructure metrics to understand system health and performance trends.
-- **Logging:** Centralize and correlate logs with traces and other telemetry to make debugging easier.
-- **Error tracking:** Detect errors quickly and investigate their root causes with the surrounding context.
-- **SLA monitoring:** Track service-level objectives and identify when your application is approaching or exceeding defined thresholds.
-- **Alarms and alerts:** Set up alerts for critical errors, performance degradation, SLA violations, and other anomalies so your team can react quickly.
+Também são configuráveis `SQS_CONSUMER_NAME`, `SQS_QUEUE_NAME`, `SQS_DLQ_NAME` e `SQS_EVENTS_QUEUE_NAME`. O serviço `app` usa os hostnames internos `postgres` e `ministack`; os ports publicados servem para ferramentas que rodam no host. As credenciais `test` do ambiente local não devem ser reutilizadas na AWS.
 
-Application metrics are registered through `AppMetrics` and exported by NestJS Observe:
+No fluxo padrão do Compose, as URLs internas são calculadas a partir dos nomes das filas e o consumer e publisher são iniciados automaticamente.
 
-- `wager_transactions_total{status}` — completed operation responses by final state.
-- `wager_transaction_duplicates_total` — idempotent replays and external/idempotency conflicts.
-- `messaging_retries_total{source}` — scheduled SQS and outbox retries.
-- `sqs_messages_dead_lettered_total` — messages sent to the DLQ.
-- `database_lock_conflicts_total` — PostgreSQL deadlocks and lock/serialization timeouts detected by the idempotency executor.
-- `outbox_lag_ms` — event age at successful publication.
-- `wager_processing_latency_ms` — wager use-case duration, including errors.
-- `wallet_reconciliation_mismatches_total` — wallet reconciliation mismatches.
+## Testes
 
-Business and messaging logs are JSON and include `correlationId`, `messageId`, `transactionId`, `walletId`, and `providerId` where available. They record identifiers, status, retry counts, and error codes/names only; request bodies, money values, balances, credentials, and idempotency keys are not logged. `GET /health/live` checks process liveness; `GET /health/ready` independently reports PostgreSQL and MiniStack availability.
+```powershell
+# Testes unitários e testes sem dependências externas
+npm test
 
-This project is already instrumented. Create a free account at [observe.nestjs.com](https://observe.nestjs.com), add an application, and paste the generated app key and secret into the `ObserveModule.forRoot()` call in `src/app.module.ts`.
+# Testes HTTP e Swagger com providers de aplicação simulados
+npm run test:e2e
 
-The free plan needs no payment details and covers 300,000 events a month. You can also browse the [live demo](https://www.observe-demo.nestjs.com/dashboard) first - the whole dashboard over a busy service's data, with nothing to install.
+# Testes opt-in com PostgreSQL e MiniStack reais
+npm run test:integration
 
-## Resources
+# Build, type-check e lint
+npm run build
+npx tsc --noEmit
+npm run lint
+```
 
-Check out a few resources that may come in handy when working with NestJS:
+### Testes unitários e HTTP
 
-- Visit the [NestJS Documentation](https://docs.nestjs.com) to learn more about the framework.
-- For questions and support, please visit our [Discord channel](https://discord.gg/G7Qnnhy).
-- To dive deeper and get more hands-on experience, check out our official video [courses](https://courses.nestjs.com/).
-- Deploy your application to AWS with the help of [NestJS Mau](https://mau.nestjs.com) in just a few clicks.
-- Auto-instrument your application with [NestJS Observe](https://observe.nestjs.com). Distributed tracing, metrics, and logging made easy. Error tracking and performance monitoring for your NestJS applications.
-- Visualize your application graph and interact with the NestJS application in real-time using [NestJS Devtools](https://devtools.nestjs.com).
-- Need help with your project (part-time to full-time)? Check out our official [enterprise support](https://enterprise.nestjs.com).
-- To stay in the loop and get updates, follow us on [X](https://x.com/nestframework) and [LinkedIn](https://linkedin.com/company/nestjs).
-- Looking for a job, or have a job to offer? Check out our official [Jobs board](https://jobs.nestjs.com).
+A suíte unitária cobre objetos de valor, invariantes de wallet/transação/ledger, regras e referências, canonicalização/hash de payload, inbox/outbox, idempotência e consumer. Os testes e2e HTTP verificam contrato OpenAPI, validação, header idempotente, mapeamento de status e health checks; não inicializam PostgreSQL nem SQS reais.
 
-## Support
+### Testes reais (opt-in)
 
-Nest is an MIT-licensed open source project. It can grow thanks to the sponsors and support by the amazing backers. If you'd like to join them, please [read more here](https://docs.nestjs.com/support).
+Os testes PostgreSQL exigem um banco descartável **com as migrations já aplicadas** em `TEST_DATABASE_URL`. Cobrem a presença de colunas, índices e constraints requeridos, abertura financiada da wallet e concorrência usando três instâncias MikroORM independentes: 50 entregas com mesma chave/inbox, disputa de saldo, identificador externo repetido entre carteiras, carteiras distintas e publishers concorrentes. Um cenário adicional inicia três processos Node independentes com 15 entregas paralelas em cada um para a mesma operação.
 
-## Stay in touch
+O cenário fim a fim PostgreSQL + MiniStack verifica processamento de entrada por SQS, persistência em inbox/ledger/outbox, publicação dos eventos e encaminhamento de mensagem malformada para DLQ. Também encerra um processo de worker depois do commit financeiro e antes do ACK, reabre a conexão PostgreSQL e confirma que o redelivery é processado como replay sem duplicar efeitos. Use filas de teste isoladas, nunca as filas compartilhadas de desenvolvimento.
 
-- Author - [Kamil Myśliwiec](https://twitter.com/kammysliwiec)
-- Website - [https://nestjs.com](https://nestjs.com/)
-- Twitter - [@nestframework](https://twitter.com/nestframework)
+Crie um banco de teste separado (uma única vez) e filas isoladas para não consumir ou alterar dados de desenvolvimento:
 
-## License
+```powershell
+$env:TEST_DATABASE_URL = 'postgresql://root:rootpassword@localhost:5432/backend_challenge_test'
+$env:DATABASE_URL = $env:TEST_DATABASE_URL
+$env:SQS_QUEUE_NAME = 'wager-transactions-test.fifo'
+$env:SQS_DLQ_NAME = 'wager-transactions-test-dlq.fifo'
+$env:SQS_EVENTS_QUEUE_NAME = 'wager-events-test.fifo'
+docker compose exec -T postgres psql -U root -d postgres -c 'CREATE DATABASE backend_challenge_test;'
+docker compose run --rm sqs-init
+npm run migration:up
+```
 
-Nest is [MIT licensed](https://github.com/nestjs/nest/blob/master/LICENSE).
+Configure as variáveis de teste e execute:
+
+```powershell
+$env:TEST_SQS_ENDPOINT_URL = 'http://localhost:4566'
+$env:TEST_SQS_QUEUE_URL = 'http://localhost:4566/000000000000/wager-transactions-test.fifo'
+$env:TEST_SQS_DLQ_URL = 'http://localhost:4566/000000000000/wager-transactions-test-dlq.fifo'
+$env:TEST_SQS_EVENTS_QUEUE_URL = 'http://localhost:4566/000000000000/wager-events-test.fifo'
+npm run test:integration
+```
+
+Os testes de concorrência do banco são ignorados sem `TEST_DATABASE_URL`; o cenário que toca filas reais também é ignorado até que todas as variáveis `TEST_SQS_*` acima estejam definidas. Evite executar sobre filas que tenham mensagens que não pertençam ao teste.
+
+### Cobertura ainda necessária para o item 13
+
+Ainda faltam testes com três **containers** de aplicação distintos (a concorrência multiprocess atual usa três processos Node no mesmo host), publishers concorrentes contra MiniStack real e retry/backoff transitório exercitado na fila real. A suíte verifica migrations já aplicadas, mas não sobe um banco vazio e aplica migrations automaticamente como parte do teste. A ausência de Docker/PostgreSQL neste ambiente impede executar os opt-in aqui; não deve ser interpretada como resultado aprovado desses cenários.
+
+## Observabilidade e health checks
+
+Os logs de processamento, consumer, DLQ, reconciliação e publisher são JSON e incluem IDs de correlação disponíveis. Não registram payloads completos, valores/saldos, chaves de idempotência nem credenciais.
+
+Métricas customizadas registradas por `AppMetrics`:
+
+- `wager_transactions_total{status}`;
+- `wager_transaction_duplicates_total`;
+- `messaging_retries_total{source}` (`sqs` ou `outbox`);
+- `sqs_messages_dead_lettered_total`;
+- `database_lock_conflicts_total`;
+- `wager_processing_latency_ms`;
+- `outbox_lag_ms`;
+- `wallet_reconciliation_mismatches_total`.
+
+Os labels usam apenas valores de cardinalidade limitada; IDs não são labels. `/health/live` verifica que o processo responde. `/health/ready` consulta PostgreSQL e o endpoint HTTP do emulador; SQS não configurado aparece como `not_configured` e torna o serviço não pronto.
+
+O módulo NestJS Observe está preparado, mas `appKey`/`appSecret` ainda são placeholders em `src/app.module.ts`. Configure credenciais reais antes de esperar exportação para um workspace Observe.
+
+## Aderência à arquitetura e limitações conhecidas
+
+A separação de camadas, PostgreSQL como fonte da verdade, `Money` decimal, locks transacionais, constraints de idempotência, inbox/outbox, SQS FIFO, API e health checks seguem as decisões centrais de [ARCHITECTURE.md](./ARCHITECTURE.md). As migrations e o schema materializam as cinco tabelas de persistência e suas relações.
+
+Diferenças e itens de hardening que devem permanecer explícitos:
+
+- A arquitetura inicial menciona Bun e LocalStack; o repositório usa npm/Node (`package-lock.json`) e MiniStack. O Compose e as variáveis do serviço estão calibrados para MiniStack.
+- O guard de identidade de provedor é no-op; autenticação não está atendida.
+- O reprocessador de transações com referência pendente existe como caso de uso/adaptador, mas ainda não está registrado em scheduler ou worker NestJS, então não há execução periódica automática.
+- Idempotência/Inbox/Outbox e transações estão implementados, porém ledger imutável é uma regra da aplicação, não uma restrição que impeça alterações diretas via SQL.
+- A recuperação por crash/ACK é validada opt-in em processo local; não há ainda execução em três containers, publisher concorrente usando MiniStack real, retry transitório validado contra a fila real ou bootstrap de migrations em banco vazio na suíte.
+
+Esses pontos não devem ser tratados como garantias de produção sem a implementação e validação adicionais descritas.

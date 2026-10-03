@@ -19,7 +19,11 @@
     "test:watch": "vitest",
     "test:cov": "vitest run --coverage",
     "test:debug": "vitest --inspect-brk --no-file-parallelism",
-    "test:e2e": "vitest run --config ./vitest.config.e2e.ts"
+    "test:integration": "vitest run src/infrastructure/database/mikro-orm/repositories/wager-transaction-concurrency.integration.spec.ts test/sqs-postgres.integration.spec.ts",
+    "test:e2e": "vitest run --config ./vitest.config.e2e.ts",
+    "migration:up": "mikro-orm migration:up --config ./mikro-orm.config.ts",
+    "db:initialize": "node dist/infrastructure/database/mikro-orm/run-migrations.js",
+    "start:container": "node dist/infrastructure/database/mikro-orm/run-migrations.js && node dist/main.js"
   },
   "dependencies": {
     "@aws-sdk/client-sqs": "^3.1146.0",
@@ -37,6 +41,7 @@
     "rxjs": "^7.8.1"
   },
   "devDependencies": {
+    "@mikro-orm/cli": "^7.2.3",
     "@nestjs/cli": "^12.0.0",
     "@nestjs/mau": "^0.2.6",
     "@nestjs/schematics": "^12.0.0",
@@ -50,6 +55,7 @@
     "prettier": "^3.4.2",
     "source-map-support": "^0.5.21",
     "supertest": "^7.0.0",
+    "tsx": "^4.23.15",
     "typescript": "^6.0.2",
     "vite-tsconfig-paths": "^5.1.4",
     "vitest": "^4.1.2"

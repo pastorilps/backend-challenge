@@ -1,7 +1,10 @@
 import { MikroORM } from '@mikro-orm/postgresql';
+import { spawn } from 'node:child_process';
+import { resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { ProcessWagerTransactionUseCase } from '../../../../application/wagering/process-wager-transaction/process-wager-transaction.use-case.js';
+import { CreateWalletUseCase } from '../../../../application/wallets/create-wallet/create-wallet.use-case.js';
 import { WagerTransactionKind } from '../../../../domain/wagering/enums/wager-transaction-kind.js';
 import { WagerTransactionStatus } from '../../../../domain/wagering/enums/wager-transaction-status.js';
 import {
@@ -149,11 +152,7 @@ integration('PostgreSQL wager transaction concurrency', () => {
 
     const results = await Promise.all(
       Array.from({ length: 50 }, (_, index) =>
-        useCases[index % useCases.length].execute(
-          payload,
-          key,
-          inboxReceipt,
-        ),
+        useCases[index % useCases.length].execute(payload, key, inboxReceipt),
       ),
     );
     const persistedWallet = await ormInstances[0].em
@@ -162,6 +161,9 @@ integration('PostgreSQL wager transaction concurrency', () => {
     const entryCount = await ormInstances[0].em
       .fork()
       .count(WalletLedgerEntryOrmEntity, { wallet: walletId });
+    const outboxCount = await ormInstances[0].em
+      .fork()
+      .count(OutboxMessageOrmEntity, { aggregateId: walletId });
     const inboxCount = await ormInstances[0].em
       .fork()
       .count(InboxMessageOrmEntity, {
@@ -178,8 +180,63 @@ integration('PostgreSQL wager transaction concurrency', () => {
     ).toHaveLength(49);
     expect(persistedWallet.balanceAmount).toBe('99.00');
     expect(entryCount).toBe(1);
+    expect(outboxCount).toBe(2);
     expect(inboxCount).toBe(1);
   }, 30_000);
+
+  it('keeps a wager idempotent across three real Node.js processes', async () => {
+    const walletId = await createWallet('100.00');
+    const wallet = await ormInstances[0].em
+      .fork()
+      .findOneOrFail(WalletOrmEntity, { id: walletId });
+    const messageId = `multiprocess-${randomUUID()}`;
+    inboxMessageIds.push(messageId);
+    const input = {
+      databaseUrl: getTestDatabaseUrl(),
+      requestCount: 15,
+      startAt: Date.now() + 2_000,
+      operation: request(walletId, `multiprocess-${randomUUID()}`, '1.00'),
+      idempotencyKey: `multiprocess-key-${randomUUID()}`,
+      inboxReceipt: {
+        consumerName: 'multiprocess-concurrency-test',
+        messageId,
+        payloadHash: 'c'.repeat(64),
+        payloadJson: { messageId, type: 'WagerTransactionRequested' },
+        attempts: 1,
+      },
+    };
+    input.operation.playerId = wallet.playerId;
+
+    const workerResults = await Promise.all(
+      Array.from({ length: 3 }, () => runProcessWorker(input)),
+    );
+    const persistedWallet = await ormInstances[0].em
+      .fork()
+      .findOneOrFail(WalletOrmEntity, { id: walletId });
+    const transactions = await ormInstances[0].em
+      .fork()
+      .find(WagerTransactionOrmEntity, { wallet: walletId });
+    const ledgerEntries = await ormInstances[0].em
+      .fork()
+      .find(WalletLedgerEntryOrmEntity, { wallet: walletId });
+    const inbox = await ormInstances[0].em
+      .fork()
+      .findOneOrFail(InboxMessageOrmEntity, {
+        consumerName: 'multiprocess-concurrency-test',
+        messageId,
+      });
+
+    expect(
+      workerResults.reduce((total, result) => total + result.processed, 0),
+    ).toBe(1);
+    expect(
+      workerResults.reduce((total, result) => total + result.replays, 0),
+    ).toBe(44);
+    expect(persistedWallet.balanceAmount).toBe('99.00');
+    expect(transactions).toHaveLength(1);
+    expect(ledgerEntries).toHaveLength(1);
+    expect(inbox.status).toBe('PROCESSED');
+  }, 60_000);
 
   it('persists terminal business failures in the inbox after rolling back finance', async () => {
     const walletId = await createWallet('100.00');
@@ -211,21 +268,13 @@ integration('PostgreSQL wager transaction concurrency', () => {
     const idempotencyKey = `duplicate-key-${randomUUID()}`;
 
     await expect(
-      useCases[1].execute(
-        duplicateOperation,
-        idempotencyKey,
-        inboxReceipt,
-      ),
+      useCases[1].execute(duplicateOperation, idempotencyKey, inboxReceipt),
     ).rejects.toMatchObject({
       code: 'DUPLICATE_EXTERNAL_TRANSACTION',
       statusCode: 409,
     });
     await expect(
-      useCases[2].execute(
-        duplicateOperation,
-        idempotencyKey,
-        inboxReceipt,
-      ),
+      useCases[2].execute(duplicateOperation, idempotencyKey, inboxReceipt),
     ).rejects.toMatchObject({
       code: 'INBOX_MESSAGE_ALREADY_PROCESSED',
       statusCode: 409,
@@ -252,6 +301,79 @@ integration('PostgreSQL wager transaction concurrency', () => {
     expect(persistedWallet.balanceAmount).toBe('90.00');
     expect(transactionCount).toBe(1);
   }, 30_000);
+
+  it('creates a funded wallet with its opening transaction and ledger entry', async () => {
+    const created = await new CreateWalletUseCase(ormInstances[0]).execute({
+      playerId: `opening-player-${randomUUID()}`,
+      initialBalance: { amount: '125.50', currency: 'BRL' },
+    });
+    walletIds.push(created.id);
+
+    const em = ormInstances[0].em.fork();
+    const wallet = await em.findOneOrFail(WalletOrmEntity, { id: created.id });
+    const opening = await em.findOneOrFail(WagerTransactionOrmEntity, {
+      wallet: created.id,
+      kind: 'OPENING',
+    });
+    const ledgerEntries = await em.find(WalletLedgerEntryOrmEntity, {
+      wallet: created.id,
+    });
+
+    expect(created.balance).toEqual({ amount: '125.50', currency: 'BRL' });
+    expect(opening.status).toBe(WagerTransactionStatus.Processed);
+    expect(ledgerEntries).toHaveLength(1);
+    expect(ledgerEntries[0]).toMatchObject({
+      direction: 'CREDIT',
+      amount: '125.50',
+      balanceBeforeAmount: '0.00',
+      balanceAfterAmount: '125.50',
+    });
+    expect(wallet.balanceAmount).toBe('125.50');
+  });
+
+  it('has the versioned columns and constraints required by the current schema', async () => {
+    const em = ormInstances[0].em.fork();
+    const columns = (await em.getConnection().execute(
+      `select column_name
+         from information_schema.columns
+        where table_schema = current_schema()
+          and table_name = 'wager_transactions'
+          and column_name in (
+            'idempotency_response',
+            'reference_attempts',
+            'reference_next_attempt_at'
+          )`,
+    )) as Array<{ column_name: string }>;
+    const constraints = (await em.getConnection().execute(
+      `select conname
+         from pg_constraint
+        where conrelid = 'wager_transactions'::regclass
+          and conname in (
+            'wager_transactions_idempotency_key_uq',
+            'wager_transactions_provider_external_id_uq',
+            'wager_transactions_reference_attempts_check'
+          )`,
+    )) as Array<{ conname: string }>;
+    const indexes = (await em.getConnection().execute(
+      `select indexname
+         from pg_indexes
+        where schemaname = current_schema()
+          and tablename = 'wager_transactions'
+          and indexname = 'wager_transactions_pending_reference_idx'`,
+    )) as Array<{ indexname: string }>;
+
+    expect(columns.map(({ column_name }) => column_name).sort()).toEqual([
+      'idempotency_response',
+      'reference_attempts',
+      'reference_next_attempt_at',
+    ]);
+    expect(constraints.map(({ conname }) => conname).sort()).toEqual([
+      'wager_transactions_idempotency_key_uq',
+      'wager_transactions_provider_external_id_uq',
+      'wager_transactions_reference_attempts_check',
+    ]);
+    expect(indexes).toHaveLength(1);
+  });
 
   it('allows only one of two concurrent 80.00 bets against a 100.00 wallet', async () => {
     const walletId = await createWallet('100.00');
@@ -411,7 +533,9 @@ integration('PostgreSQL wager transaction concurrency', () => {
       new SqsEventPublisher(ormInstances[1].em, queueClient, config),
     ];
 
-    await Promise.all(publishers.map((publisher) => publisher.publishDueBatch()));
+    await Promise.all(
+      publishers.map((publisher) => publisher.publishDueBatch()),
+    );
 
     const pendingMessages = await ormInstances[0].em
       .fork()
@@ -429,8 +553,9 @@ integration('PostgreSQL wager transaction concurrency', () => {
     expect(publishedBodies).toHaveLength(2);
     expect(pendingMessages).toHaveLength(0);
     expect(publishedMessages).toHaveLength(2);
-    expect(new Set(publishedBodies.map((body) => JSON.parse(body).eventId)).size)
-      .toBe(2);
+    expect(
+      new Set(publishedBodies.map((body) => JSON.parse(body).eventId)).size,
+    ).toBe(2);
   }, 30_000);
 
   it('retries failed outbox publication with backoff and preserves the event ID', async () => {
@@ -496,3 +621,55 @@ integration('PostgreSQL wager transaction concurrency', () => {
     expect(publishedEventIds).toContain(failedEventId);
   }, 30_000);
 });
+
+function runProcessWorker(
+  input: object,
+): Promise<{ processed: number; replays: number }> {
+  return new Promise((resolveResult, reject) => {
+    const worker = spawn(
+      process.execPath,
+      [
+        '--import',
+        'tsx',
+        resolve(process.cwd(), 'test', 'support', 'wager-process-worker.ts'),
+      ],
+      {
+        cwd: process.cwd(),
+        env: {
+          ...process.env,
+          WORKER_INPUT: JSON.stringify(input),
+        },
+      },
+    );
+    let stdout = '';
+    let stderr = '';
+    worker.stdout.setEncoding('utf8');
+    worker.stderr.setEncoding('utf8');
+    worker.stdout.on('data', (chunk: string) => {
+      stdout += chunk;
+    });
+    worker.stderr.on('data', (chunk: string) => {
+      stderr += chunk;
+    });
+    worker.on('error', reject);
+    worker.on('close', (code) => {
+      const resultLine = stdout
+        .split(/\r?\n/)
+        .find((line) => line.startsWith('WORKER_RESULT:'));
+      if (code !== 0 || !resultLine) {
+        reject(
+          new Error(
+            `Concurrency worker exited with ${code}; stderr: ${stderr}; stdout: ${stdout}`,
+          ),
+        );
+        return;
+      }
+      resolveResult(
+        JSON.parse(resultLine.slice('WORKER_RESULT:'.length)) as {
+          processed: number;
+          replays: number;
+        },
+      );
+    });
+  });
+}

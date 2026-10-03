@@ -1,3 +1,4 @@
+import 'dotenv/config';
 import { defineConfig } from '@mikro-orm/postgresql';
 import {
   InboxMessageSchema,

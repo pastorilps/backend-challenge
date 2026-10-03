@@ -1,49 +1,29 @@
 services:
-  # --- BANCO DE DADOS POSTGRESQL (BANCO ÚNICO) ---
   postgres:
     image: postgres:16-alpine
-    container_name: local_postgres
-    restart: always
+    restart: unless-stopped
     environment:
-      POSTGRES_USER: root
-      POSTGRES_PASSWORD: rootpassword
-      POSTGRES_DB: my_database
+      POSTGRES_USER: ${POSTGRES_USER:-root}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-rootpassword}
+      POSTGRES_DB: ${POSTGRES_DB:-monkeyg}
     ports:
-      - '5432:5432'
+      - '${POSTGRES_PORT:-5432}:5432'
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ['CMD-SHELL', 'pg_isready -U root -d my_database']
+      test: ['CMD-SHELL', 'pg_isready -U "$$POSTGRES_USER" -d "$$POSTGRES_DB"']
       interval: 5s
       timeout: 5s
       retries: 5
+      start_period: 5s
     networks:
       - app_network
 
-  # --- CACHE / NO SQL REDIS ---
-  redis:
-    image: redis:7-alpine
-    container_name: local_redis
-    restart: always
-    ports:
-      - '6379:6379'
-    volumes:
-      - redis_data:/data
-    healthcheck:
-      test: ['CMD', 'redis-cli', 'ping']
-      interval: 5s
-      timeout: 3s
-      retries: 5
-    networks:
-      - app_network
-
-  # --- EMULADOR AWS MINISTACK (APENAS SQS) ---
   ministack:
     image: ministackorg/ministack:latest
-    container_name: local_aws
-    restart: always
+    restart: unless-stopped
     ports:
-      - '4566:4566'
+      - '${MINISTACK_PORT:-4566}:4566'
     environment:
       LOG_LEVEL: ${MINISTACK_LOG_LEVEL:-INFO}
       MINISTACK_ACCOUNT_ID: ${AWS_ACCOUNT_ID:-000000000000}
@@ -63,7 +43,6 @@ services:
 
   sqs-init:
     image: amazon/aws-cli:2
-    container_name: local_sqs_init
     entrypoint: ['/bin/sh', '/scripts/init-sqs.sh']
     restart: 'no'
     environment:
@@ -85,9 +64,58 @@ services:
     networks:
       - app_network
 
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      DATABASE_URL: postgresql://${POSTGRES_USER:-root}:${POSTGRES_PASSWORD:-rootpassword}@postgres:5432/${POSTGRES_DB:-monkeyg}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-test}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-test}
+      AWS_REGION: ${AWS_REGION:-us-east-1}
+      SQS_ENDPOINT_URL: http://ministack:4566
+      SQS_QUEUE_URL: http://ministack:4566/${AWS_ACCOUNT_ID:-000000000000}/${SQS_QUEUE_NAME:-wager-transactions.fifo}
+      SQS_DLQ_URL: http://ministack:4566/${AWS_ACCOUNT_ID:-000000000000}/${SQS_DLQ_NAME:-wager-transactions-dlq.fifo}
+      SQS_EVENTS_QUEUE_URL: http://ministack:4566/${AWS_ACCOUNT_ID:-000000000000}/${SQS_EVENTS_QUEUE_NAME:-wager-events.fifo}
+      SQS_HEALTHCHECK_URL: http://ministack:4566/_ministack/health
+      SQS_QUEUE_NAME: ${SQS_QUEUE_NAME:-wager-transactions.fifo}
+      SQS_DLQ_NAME: ${SQS_DLQ_NAME:-wager-transactions-dlq.fifo}
+      SQS_EVENTS_QUEUE_NAME: ${SQS_EVENTS_QUEUE_NAME:-wager-events.fifo}
+      SQS_CONSUMER_NAME: ${SQS_CONSUMER_NAME:-wager-transaction-consumer}
+      SQS_MAX_ATTEMPTS: ${SQS_MAX_ATTEMPTS:-5}
+      SQS_RETRY_BASE_DELAY_MS: ${SQS_RETRY_BASE_DELAY_MS:-1000}
+      SQS_RETRY_MAX_DELAY_MS: ${SQS_RETRY_MAX_DELAY_MS:-300000}
+      SQS_VISIBILITY_TIMEOUT_SECONDS: ${SQS_VISIBILITY_TIMEOUT_SECONDS:-60}
+      SQS_WAIT_TIME_SECONDS: ${SQS_WAIT_TIME_SECONDS:-20}
+      OUTBOX_BATCH_SIZE: ${OUTBOX_BATCH_SIZE:-10}
+      OUTBOX_POLL_INTERVAL_MS: ${OUTBOX_POLL_INTERVAL_MS:-1000}
+    ports:
+      - '${APP_PORT:-3000}:3000'
+    depends_on:
+      postgres:
+        condition: service_healthy
+      sqs-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test:
+        [
+          'CMD',
+          'node',
+          '-e',
+          "fetch('http://127.0.0.1:3000/health/ready').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks:
+      - app_network
+
 volumes:
   postgres_data:
-  redis_data:
 
 networks:
   app_network:
