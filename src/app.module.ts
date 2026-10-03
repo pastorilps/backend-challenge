@@ -27,6 +27,10 @@ import {
   loadWagerTransactionSqsConsumerConfig,
   WagerTransactionSqsConsumer,
 } from './infrastructure/messaging/sqs/consumers/wager-transaction.consumer.js';
+import {
+  loadSqsOutboxPublisherConfig,
+  SqsEventPublisher,
+} from './infrastructure/messaging/sqs/publishers/sqs-event.publisher.js';
 
 export const { ObserveModule, ObserveInstrument } = createObserveModule();
 
@@ -97,6 +101,16 @@ export const { ObserveModule, ObserveInstrument } = createObserveModule();
           loadWagerTransactionSqsConsumerConfig(),
         ),
       inject: [SQS_QUEUE_CLIENT, ProcessWagerTransactionUseCase],
+    },
+    {
+      provide: SqsEventPublisher,
+      useFactory: (orm: MikroORM, queueClient: SqsQueueClient) =>
+        new SqsEventPublisher(
+          orm.em,
+          queueClient,
+          loadSqsOutboxPublisherConfig(),
+        ),
+      inject: [DATABASE_ORM, SQS_QUEUE_CLIENT],
     },
   ],
 })

@@ -73,11 +73,15 @@ function createQueueClient() {
   const sendToDeadLetterQueue = vi
     .fn<SqsQueueClient['sendToDeadLetterQueue']>()
     .mockResolvedValue(undefined);
+  const publishEvent = vi
+    .fn<SqsQueueClient['publishEvent']>()
+    .mockResolvedValue(undefined);
   const client: SqsQueueClient = {
     receiveMessages,
     deleteMessage,
     changeMessageVisibility,
     sendToDeadLetterQueue,
+    publishEvent,
   };
   return {
     client,
@@ -85,6 +89,7 @@ function createQueueClient() {
     deleteMessage,
     changeMessageVisibility,
     sendToDeadLetterQueue,
+    publishEvent,
   };
 }
 

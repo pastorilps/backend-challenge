@@ -45,11 +45,12 @@ Provider authentication is intentionally not implemented for this challenge. The
 
 ## SQS wager consumer
 
-The worker consumes `WagerTransactionRequested` messages from the FIFO source queue and uses the same wager use case as the HTTP API. `docker compose up -d` starts MiniStack and a one-shot initializer that creates the source queue and FIFO DLQ with the required redrive policy. The default configuration is:
+The worker consumes `WagerTransactionRequested` messages from the FIFO source queue and uses the same wager use case as the HTTP API. `docker compose up -d` starts MiniStack and a one-shot initializer that creates the source queue, FIFO DLQ, and the FIFO integration-events queue used by the transactional outbox. The default configuration is:
 
 ```text
 SQS_QUEUE_URL=http://localhost:4566/000000000000/wager-transactions.fifo
 SQS_DLQ_URL=http://localhost:4566/000000000000/wager-transactions-dlq.fifo
+SQS_EVENTS_QUEUE_URL=http://localhost:4566/000000000000/wager-events.fifo
 SQS_ENDPOINT_URL=http://localhost:4566
 AWS_REGION=us-east-1
 SQS_HEALTHCHECK_URL=http://localhost:4566/_ministack/health
@@ -65,13 +66,19 @@ npm run start:dev
 
 Compose reads `.env` automatically; the Nest application loads the same file through `dotenv`. The AWS SDK uses its normal credential provider chain. The example uses MiniStack's local test credentials (`test`/`test`), which must not be reused in AWS. If both queue URLs are omitted, the HTTP service starts with the consumer disabled; setting only one is a startup configuration error.
 
-The queue initializer runs once after MiniStack reports healthy. If queues need to be recreated after resetting MiniStack, run `docker compose run --rm sqs-init`. Queue names and retry count can be overridden with `SQS_QUEUE_NAME`, `SQS_DLQ_NAME`, and `SQS_MAX_ATTEMPTS` in `.env`.
+The queue initializer runs once after MiniStack reports healthy. If queues need to be recreated after resetting MiniStack, run `docker compose run --rm sqs-init`. Queue names and retry count can be overridden with `SQS_QUEUE_NAME`, `SQS_DLQ_NAME`, `SQS_EVENTS_QUEUE_NAME`, and `SQS_MAX_ATTEMPTS` in `.env`.
 
-The sample endpoint and queue URLs target an application running on the host. If the application is later run inside `app_network`, use `SQS_ENDPOINT_URL=http://ministack:4566`, `SQS_QUEUE_URL=http://ministack:4566/000000000000/wager-transactions.fifo`, `SQS_DLQ_URL=http://ministack:4566/000000000000/wager-transactions-dlq.fifo`, and `SQS_HEALTHCHECK_URL=http://ministack:4566/_ministack/health`.
+The sample endpoint and queue URLs target an application running on the host. If the application is later run inside `app_network`, use `SQS_ENDPOINT_URL=http://ministack:4566`, `SQS_QUEUE_URL=http://ministack:4566/000000000000/wager-transactions.fifo`, `SQS_DLQ_URL=http://ministack:4566/000000000000/wager-transactions-dlq.fifo`, `SQS_EVENTS_QUEUE_URL=http://ministack:4566/000000000000/wager-events.fifo`, and `SQS_HEALTHCHECK_URL=http://ministack:4566/_ministack/health`.
 
 The message body follows section 10 of `PLAN.md`; its `data` also includes `idempotencyKey`. Business validation errors are terminal and acknowledged after being persisted in the inbox. Invalid or conflicting message IDs go to the configured FIFO DLQ. Other failures are retried with exponential visibility backoff and sent to the DLQ after `SQS_MAX_ATTEMPTS` (default `5`).
 
 Optional tuning variables are `SQS_CONSUMER_NAME` (default `wager-transaction-consumer`), `SQS_MAX_ATTEMPTS`, `SQS_RETRY_BASE_DELAY_MS` (default `1000`), `SQS_RETRY_MAX_DELAY_MS` (default `300000`), `SQS_VISIBILITY_TIMEOUT_SECONDS` (default `60`), and `SQS_WAIT_TIME_SECONDS` (default `20`). On shutdown the worker stops polling, cancels the long poll, and waits for the current message handler to finish.
+
+## Transactional outbox
+
+The outbox publisher sends committed integration events to `SQS_EVENTS_QUEUE_URL`. It claims due rows in PostgreSQL using `FOR UPDATE SKIP LOCKED`, publishes them to the FIFO queue with `aggregateId` as the message group and the stable `eventId` as the deduplication ID, then marks them `PUBLISHED` in the same SQL transaction. Concurrent app instances claim separate rows. If publishing fails, the row stays pending and `attempts`/`nextAttemptAt` are updated with exponential backoff; after a process crash, uncommitted row locks are released and another instance can claim the event.
+
+SQS delivery is at-least-once: a process/database failure after SQS accepts an event but before PostgreSQL commits can cause a duplicate publish. Consumers must deduplicate by the stable envelope `eventId`; FIFO deduplication is an additional short-window safeguard, not the correctness guarantee. Configure `OUTBOX_BATCH_SIZE` (default `10`) and `OUTBOX_POLL_INTERVAL_MS` (default `1000`). The publisher starts only when `SQS_EVENTS_QUEUE_URL` is configured, so outbox rows remain persisted and pending otherwise.
 
 ## Compile and run the project
 

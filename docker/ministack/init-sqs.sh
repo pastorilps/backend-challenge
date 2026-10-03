@@ -5,6 +5,7 @@ endpoint="${SQS_ENDPOINT_URL:-http://ministack:4566}"
 region="${AWS_DEFAULT_REGION:-us-east-1}"
 queue_name="${SQS_QUEUE_NAME:-wager-transactions.fifo}"
 dlq_name="${SQS_DLQ_NAME:-wager-transactions-dlq.fifo}"
+events_queue_name="${SQS_EVENTS_QUEUE_NAME:-wager-events.fifo}"
 max_attempts="${SQS_MAX_ATTEMPTS:-5}"
 
 case "$max_attempts" in
@@ -40,4 +41,10 @@ aws_sqs create-queue \
   >/dev/null
 
 queue_url="$(aws_sqs get-queue-url --queue-name "$queue_name" --query QueueUrl --output text)"
-echo "SQS queues are ready: $queue_url and $dlq_url"
+aws_sqs create-queue \
+  --queue-name "$events_queue_name" \
+  --attributes '{"FifoQueue":"true","ContentBasedDeduplication":"false"}' \
+  >/dev/null
+
+events_queue_url="$(aws_sqs get-queue-url --queue-name "$events_queue_name" --query QueueUrl --output text)"
+echo "SQS queues are ready: $queue_url, $dlq_url, and $events_queue_url"

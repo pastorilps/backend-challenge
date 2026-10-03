@@ -18,6 +18,8 @@ import { InboxMessageOrmEntity } from '../entities/inbox-message.orm-entity.js';
 import { WagerTransactionOrmEntity } from '../entities/wager-transaction.orm-entity.js';
 import { WalletLedgerEntryOrmEntity } from '../entities/wallet-ledger-entry.orm-entity.js';
 import { WalletOrmEntity } from '../entities/wallet.orm-entity.js';
+import { SqsEventPublisher } from '../../../messaging/sqs/publishers/sqs-event.publisher.js';
+import { SqsQueueClient } from '../../../messaging/sqs/sqs-queue-client.js';
 
 function getTestDatabaseUrl(): string {
   const url = process.env.TEST_DATABASE_URL;
@@ -373,5 +375,124 @@ integration('PostgreSQL wager transaction concurrency', () => {
       '90.00',
       '90.00',
     ]);
+  }, 30_000);
+
+  it('allows concurrent outbox publishers to claim separate rows only once', async () => {
+    const walletId = await createWallet('100.00');
+    const wallet = await ormInstances[0].em
+      .fork()
+      .findOneOrFail(WalletOrmEntity, { id: walletId });
+    await useCases[0].execute(
+      {
+        ...request(walletId, `outbox-${randomUUID()}`, '10.00'),
+        playerId: wallet.playerId,
+      },
+      `outbox-key-${randomUUID()}`,
+    );
+
+    const publishedBodies: string[] = [];
+    const queueClient: SqsQueueClient = {
+      receiveMessages: async () => [],
+      deleteMessage: async () => undefined,
+      changeMessageVisibility: async () => undefined,
+      sendToDeadLetterQueue: async () => undefined,
+      publishEvent: async (_url, body) => {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        publishedBodies.push(body);
+      },
+    };
+    const config = {
+      queueUrl: 'http://localhost/events.fifo',
+      batchSize: 10,
+      pollIntervalMs: 1_000,
+    };
+    const publishers = [
+      new SqsEventPublisher(ormInstances[0].em, queueClient, config),
+      new SqsEventPublisher(ormInstances[1].em, queueClient, config),
+    ];
+
+    await Promise.all(publishers.map((publisher) => publisher.publishDueBatch()));
+
+    const pendingMessages = await ormInstances[0].em
+      .fork()
+      .find(OutboxMessageOrmEntity, {
+        aggregateId: { $in: [walletId] },
+        status: 'PENDING',
+      });
+    const publishedMessages = await ormInstances[0].em
+      .fork()
+      .find(OutboxMessageOrmEntity, {
+        aggregateId: { $in: [walletId] },
+        status: 'PUBLISHED',
+      });
+
+    expect(publishedBodies).toHaveLength(2);
+    expect(pendingMessages).toHaveLength(0);
+    expect(publishedMessages).toHaveLength(2);
+    expect(new Set(publishedBodies.map((body) => JSON.parse(body).eventId)).size)
+      .toBe(2);
+  }, 30_000);
+
+  it('retries failed outbox publication with backoff and preserves the event ID', async () => {
+    const walletId = await createWallet('100.00');
+    const wallet = await ormInstances[0].em
+      .fork()
+      .findOneOrFail(WalletOrmEntity, { id: walletId });
+    await useCases[0].execute(
+      {
+        ...request(walletId, `outbox-retry-${randomUUID()}`, '10.00'),
+        playerId: wallet.playerId,
+      },
+      `outbox-retry-key-${randomUUID()}`,
+    );
+
+    const publishedEventIds: string[] = [];
+    let failNextPublish = true;
+    const queueClient: SqsQueueClient = {
+      receiveMessages: async () => [],
+      deleteMessage: async () => undefined,
+      changeMessageVisibility: async () => undefined,
+      sendToDeadLetterQueue: async () => undefined,
+      publishEvent: async (_url, body) => {
+        const eventId = JSON.parse(body).eventId as string;
+        if (failNextPublish) {
+          failNextPublish = false;
+          throw new Error('Temporary SQS failure.');
+        }
+        publishedEventIds.push(eventId);
+      },
+    };
+    const publisher = new SqsEventPublisher(ormInstances[0].em, queueClient, {
+      queueUrl: 'http://localhost/events.fifo',
+      batchSize: 10,
+      pollIntervalMs: 1_000,
+    });
+    const firstAttemptAt = new Date();
+
+    await expect(publisher.publishDueBatch(firstAttemptAt)).resolves.toBe(1);
+    const pendingRetry = await ormInstances[0].em
+      .fork()
+      .findOneOrFail(OutboxMessageOrmEntity, {
+        aggregateId: walletId,
+        status: 'PENDING',
+      });
+    const failedEventId = pendingRetry.payloadJson.eventId as string;
+    expect(pendingRetry.attempts).toBe(1);
+    expect(pendingRetry.nextAttemptAt?.getTime()).toBeGreaterThan(
+      firstAttemptAt.getTime(),
+    );
+
+    await publisher.publishDueBatch(
+      new Date((pendingRetry.nextAttemptAt?.getTime() ?? 0) + 1),
+    );
+    const retriedMessage = await ormInstances[0].em
+      .fork()
+      .findOneOrFail(OutboxMessageOrmEntity, {
+        id: pendingRetry.id,
+      });
+
+    expect(retriedMessage.status).toBe('PUBLISHED');
+    expect(retriedMessage.attempts).toBe(1);
+    expect(publishedEventIds).toContain(failedEventId);
   }, 30_000);
 });

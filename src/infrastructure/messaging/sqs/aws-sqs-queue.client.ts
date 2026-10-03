@@ -84,6 +84,22 @@ export class AwsSqsQueueClient
     );
   }
 
+  async publishEvent(
+    queueUrl: string,
+    body: string,
+    aggregateId: string,
+    eventId: string,
+  ): Promise<void> {
+    await this.client.send(
+      new SendMessageCommand({
+        QueueUrl: queueUrl,
+        MessageBody: body,
+        MessageGroupId: aggregateId,
+        MessageDeduplicationId: eventId,
+      }),
+    );
+  }
+
   onApplicationShutdown(): void {
     this.client.destroy();
   }

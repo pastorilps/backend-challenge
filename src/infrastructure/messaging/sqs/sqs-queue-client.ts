@@ -25,4 +25,10 @@ export interface SqsQueueClient {
     messageGroupId: string,
     deduplicationId: string,
   ): Promise<void>;
+  publishEvent(
+    queueUrl: string,
+    body: string,
+    aggregateId: string,
+    eventId: string,
+  ): Promise<void>;
 }
