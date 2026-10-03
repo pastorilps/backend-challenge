@@ -1,0 +1,64 @@
+version: '3.8'
+
+services:
+  # --- BANCO DE DADOS POSTGRESQL (BANCO ÚNICO) ---
+  postgres:
+    image: postgres:16-alpine
+    container_name: local_postgres
+    restart: always
+    environment:
+      POSTGRES_USER: root
+      POSTGRES_PASSWORD: rootpassword
+      POSTGRES_DB: my_database
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U root -d my_database"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - app_network
+
+  # --- CACHE / NO SQL REDIS ---
+  redis:
+    image: redis:7-alpine
+    container_name: local_redis
+    restart: always
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - app_network
+
+  # --- EMULADOR AWS MINISTACK (APENAS SQS) ---
+  ministack:
+    image: ministackorg/ministack:latest
+    container_name: local_aws
+    restart: always
+    ports:
+      - "4566:4566"
+    environment:
+      - LOG_LEVEL=INFO
+      - SERVICES=sqs
+      - DOCKER_NETWORK=app_network
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks:
+      - app_network
+
+volumes:
+  postgres_data:
+  redis_data:
+
+networks:
+  app_network:
+    name: app_network
