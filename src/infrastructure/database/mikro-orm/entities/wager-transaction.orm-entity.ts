@@ -22,6 +22,8 @@ export class WagerTransactionOrmEntity {
   declare failureCode: string | null;
   declare processedAt: Date | null;
   declare createdAt: Date;
+  declare referenceAttempts: number;
+  declare referenceNextAttemptAt: Date | null;
   declare idempotencyResponse: WagerTransactionResponse | null;
   declare ledgerEntries: WalletLedgerEntryOrmEntity[];
 }

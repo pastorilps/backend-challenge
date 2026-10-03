@@ -20,6 +20,7 @@ export interface WagerTransactionResponse {
   transactionId: string;
   status: WagerTransactionStatus;
   balance: MoneyProps | null;
+  failureCode?: string;
   idempotentReplay: false;
 }
 

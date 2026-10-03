@@ -4,6 +4,7 @@ import { OutboxMessageOrmEntity } from './entities/outbox-message.orm-entity.js'
 import { WagerTransactionOrmEntity } from './entities/wager-transaction.orm-entity.js';
 import { WalletLedgerEntryOrmEntity } from './entities/wallet-ledger-entry.orm-entity.js';
 import { WalletOrmEntity } from './entities/wallet.orm-entity.js';
+import { WagerTransactionStatus } from '../../../domain/wagering/enums/wager-transaction-status.js';
 
 export const WalletSchema = new EntitySchema<WalletOrmEntity>({
   class: WalletOrmEntity,
@@ -106,7 +107,6 @@ export const WagerTransactionSchema =
         type: 'varchar',
         fieldName: 'money_currency',
         length: 3,
-        check: "money_currency = 'BRL'",
       },
       referenceExternalTransactionId: {
         type: 'varchar',
@@ -136,6 +136,17 @@ export const WagerTransactionSchema =
       processedAt: {
         type: 'timestamptz',
         fieldName: 'processed_at',
+        nullable: true,
+      },
+      referenceAttempts: {
+        type: 'integer',
+        fieldName: 'reference_attempts',
+        default: 0,
+        check: 'reference_attempts >= 0',
+      },
+      referenceNextAttemptAt: {
+        type: 'timestamptz',
+        fieldName: 'reference_next_attempt_at',
         nullable: true,
       },
       idempotencyResponse: {
@@ -177,6 +188,11 @@ export const WagerTransactionSchema =
       {
         properties: ['roundId', 'playerId', 'wallet'],
         name: 'wager_transactions_round_player_wallet_idx',
+      },
+      {
+        properties: ['referenceNextAttemptAt'],
+        name: 'wager_transactions_pending_reference_idx',
+        where: { status: WagerTransactionStatus.PendingReference },
       },
     ],
   });

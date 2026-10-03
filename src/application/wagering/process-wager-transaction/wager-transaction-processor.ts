@@ -4,6 +4,14 @@ import {
   ProcessWagerTransactionInput,
 } from './idempotency.types.js';
 
+export abstract class PendingReferenceReprocessor {
+  abstract reprocessPendingReferences(
+    entityManager: EntityManager,
+    now: Date,
+    limit: number,
+  ): Promise<number>;
+}
+
 export abstract class WagerTransactionProcessor {
   abstract process(
     input: ProcessWagerTransactionInput,
