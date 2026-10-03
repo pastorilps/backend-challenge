@@ -26,6 +26,7 @@ async function main(): Promise<void> {
 
   const orm = await MikroORM.init({
     clientUrl: databaseUrl,
+    ensureDatabase: false,
     entities: [
       WalletSchema,
       WagerTransactionSchema,

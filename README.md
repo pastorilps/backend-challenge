@@ -65,9 +65,9 @@ O envio de transação responde `200` para processamento/replay, `202` quando ag
 
 O consumer recebe `WagerTransactionRequested`, valida o envelope, grava/processa via inbox e só então confirma a mensagem original. Erros de negócio terminais são persistidos no inbox e confirmados; mensagens malformadas/conflitantes vão para DLQ; falhas transitórias recebem visibility timeout exponencial e são enviadas à DLQ ao atingir `SQS_MAX_ATTEMPTS`. No encerramento, o consumer interrompe o long polling e aguarda o handler ativo.
 
-O publisher busca outbox pendente com `FOR UPDATE SKIP LOCKED`, publica em fila FIFO usando o agregado como `MessageGroupId` e o `eventId` como deduplication ID, e marca publicação. Falhas mantêm a linha pendente com tentativas e próximo horário de retry.
+O publisher busca outbox pendente com `FOR UPDATE SKIP LOCKED` dentro do contexto da mesma transação, publica em fila FIFO usando o agregado como `MessageGroupId` e o `eventId` como deduplication ID, e marca publicação. Os locks são mantidos até o commit para que publishers concorrentes não publiquem as mesmas linhas. Falhas mantêm a linha pendente com tentativas e próximo horário de retry.
 
-O Compose inicializa três filas FIFO no MiniStack:
+No startup, o próprio container da aplicação usa o AWS SDK para garantir três filas FIFO no MiniStack; nenhum container/CLI adicional da AWS é usado:
 
 - `wager-transactions.fifo` — entrada de transações;
 - `wager-transactions-dlq.fifo` — dead-letter queue;
@@ -96,7 +96,7 @@ Copy-Item .env.example .env
 docker compose up --build -d
 ```
 
-O Compose constrói e executa a API/worker no container `app`, inicia PostgreSQL e MiniStack, espera pelos health checks, cria as filas SQS e só então inicia a aplicação. Na primeira inicialização a aplicação cria o schema do banco; nos próximos starts aplica migrations pendentes antes de servir tráfego.
+O Compose constrói e executa a API/worker no container `app`, inicia PostgreSQL e MiniStack e espera pelos health checks. Em seguida o container `app` cria/verifica as filas SQS usando o AWS SDK, inicializa/aplica migrations e só então inicia o servidor HTTP e workers.
 
 - API: `http://localhost:3000`
 - Swagger: `http://localhost:3000/docs`
@@ -122,10 +122,10 @@ Para apagar também o volume persistente do banco (ação destrutiva, remove os 
 docker compose down --volumes
 ```
 
-O Compose inicializa o serviço `sqs-init` após o health check do MiniStack. Para reinicializar as filas após limpar o emulador, execute:
+Para recriar/verificar as filas manualmente após limpar o emulador, use o mesmo container e a mesma inicialização via AWS SDK:
 
 ```powershell
-docker compose run --rm sqs-init
+docker compose run --rm --no-deps app npm run sqs:initialize
 ```
 
 Configuração local relevante:
@@ -152,6 +152,10 @@ No fluxo padrão do Compose, as URLs internas são calculadas a partir dos nomes
 ## Testes
 
 ```powershell
+# Pipeline completo: prepara PostgreSQL/MiniStack no Docker Compose, executa
+# testes e gera .test-results/report.html e .test-results/results.json
+npm run test:report
+
 # Testes unitários e testes sem dependências externas
 npm test
 
@@ -175,19 +179,19 @@ A suíte unitária cobre objetos de valor, invariantes de wallet/transação/led
 
 Os testes PostgreSQL exigem um banco descartável **com as migrations já aplicadas** em `TEST_DATABASE_URL`. Cobrem a presença de colunas, índices e constraints requeridos, abertura financiada da wallet e concorrência usando três instâncias MikroORM independentes: 50 entregas com mesma chave/inbox, disputa de saldo, identificador externo repetido entre carteiras, carteiras distintas e publishers concorrentes. Um cenário adicional inicia três processos Node independentes com 15 entregas paralelas em cada um para a mesma operação.
 
-O cenário fim a fim PostgreSQL + MiniStack verifica processamento de entrada por SQS, persistência em inbox/ledger/outbox, publicação dos eventos e encaminhamento de mensagem malformada para DLQ. Também encerra um processo de worker depois do commit financeiro e antes do ACK, reabre a conexão PostgreSQL e confirma que o redelivery é processado como replay sem duplicar efeitos. Use filas de teste isoladas, nunca as filas compartilhadas de desenvolvimento.
+O cenário fim a fim PostgreSQL + MiniStack verifica processamento de entrada por SQS, persistência em inbox/ledger/outbox, publicação dos eventos e encaminhamento de mensagem malformada para DLQ. Também encerra um processo de worker depois do commit financeiro e antes do ACK, reabre a conexão PostgreSQL e confirma que o redelivery é processado como replay sem duplicar efeitos. A suíte cobre ainda publishers concorrentes e retry de publicação contra MiniStack real, além de `REFUND` recebido antes de sua aposta de referência e posterior reconstrução do saldo pelo ledger.
+
+`npm run test:report` é o caminho recomendado para executar tudo. Ele sobe um projeto Docker Compose isolado (`backend-challenge-tests`, portas padrão `15432`, `14566` e `13000`), cria um banco separado (`backend_challenge_test_<sufixo aleatório>` por padrão) e filas FIFO exclusivas para aquela execução, inicializa o schema, roda unitários, e2e HTTP/Swagger e as duas suítes de integração. O resultado fica em `.test-results/report.html`, com saída detalhada por etapa e uma tabela separada dos riscos eliminatórios. O arquivo JSON bruto correspondente fica em `.test-results/results.json`. Se Docker ou os serviços reais não puderem ser preparados, a etapa aparece como `NOT RUN`, o relatório fica `INCOMPLETE` e o comando termina com código `2`; falhas de teste terminam com código `1`. A pasta de resultados é ignorada pelo Git.
+
+O runner não apaga o banco ou volumes existentes, nem altera o projeto Compose de desenvolvimento. Os bancos e filas com nomes aleatórios são preservados para investigação/reexecução manual, não removidos automaticamente. `TEST_COMPOSE_PROJECT_NAME`, `TEST_COMPOSE_POSTGRES_PORT`, `TEST_COMPOSE_MINISTACK_PORT`, `TEST_COMPOSE_APP_PORT`, `TEST_DATABASE_NAME`, `TEST_SQS_QUEUE_NAME`, `TEST_SQS_DLQ_NAME` e `TEST_SQS_EVENTS_QUEUE_NAME` permitem escolher identificadores/portas isolados. Não configure o nome de um banco de desenvolvimento como `TEST_DATABASE_NAME`.
 
 Crie um banco de teste separado (uma única vez) e filas isoladas para não consumir ou alterar dados de desenvolvimento:
 
 ```powershell
 $env:TEST_DATABASE_URL = 'postgresql://root:rootpassword@localhost:5432/backend_challenge_test'
-$env:DATABASE_URL = $env:TEST_DATABASE_URL
-$env:SQS_QUEUE_NAME = 'wager-transactions-test.fifo'
-$env:SQS_DLQ_NAME = 'wager-transactions-test-dlq.fifo'
-$env:SQS_EVENTS_QUEUE_NAME = 'wager-events-test.fifo'
 docker compose exec -T postgres psql -U root -d postgres -c 'CREATE DATABASE backend_challenge_test;'
-docker compose run --rm sqs-init
-npm run migration:up
+docker compose run --rm --no-deps -e DATABASE_URL=postgresql://root:rootpassword@postgres:5432/backend_challenge_test app npm run db:initialize
+docker compose run --rm --no-deps -e SQS_QUEUE_NAME=wager-transactions-test.fifo -e SQS_DLQ_NAME=wager-transactions-test-dlq.fifo -e SQS_EVENTS_QUEUE_NAME=wager-events-test.fifo app npm run sqs:initialize
 ```
 
 Configure as variáveis de teste e execute:
@@ -202,9 +206,9 @@ npm run test:integration
 
 Os testes de concorrência do banco são ignorados sem `TEST_DATABASE_URL`; o cenário que toca filas reais também é ignorado até que todas as variáveis `TEST_SQS_*` acima estejam definidas. Evite executar sobre filas que tenham mensagens que não pertençam ao teste.
 
-### Cobertura ainda necessária para o item 13
+### Limitações da cobertura do item 13
 
-Ainda faltam testes com três **containers** de aplicação distintos (a concorrência multiprocess atual usa três processos Node no mesmo host), publishers concorrentes contra MiniStack real e retry/backoff transitório exercitado na fila real. A suíte verifica migrations já aplicadas, mas não sobe um banco vazio e aplica migrations automaticamente como parte do teste. A ausência de Docker/PostgreSQL neste ambiente impede executar os opt-in aqui; não deve ser interpretada como resultado aprovado desses cenários.
+O runner testa três processos Node e três pools PostgreSQL independentes, mas ainda não sobe três **containers** de aplicação distintos. A inicialização automatizada valida o schema atual e suas constraints em um banco isolado; ela não simula upgrades sequenciais a partir de cada versão histórica de migration. O cenário de restart comprova a recuperação do worker/mensagem após commit, não um restart coordenado de todo o Compose. Essas limitações são exibidas no relatório e não devem ser interpretadas como cenários aprovados.
 
 ## Observabilidade e health checks
 
@@ -235,6 +239,6 @@ Diferenças e itens de hardening que devem permanecer explícitos:
 - O guard de identidade de provedor é no-op; autenticação não está atendida.
 - O reprocessador de transações com referência pendente existe como caso de uso/adaptador, mas ainda não está registrado em scheduler ou worker NestJS, então não há execução periódica automática.
 - Idempotência/Inbox/Outbox e transações estão implementados, porém ledger imutável é uma regra da aplicação, não uma restrição que impeça alterações diretas via SQL.
-- A recuperação por crash/ACK é validada opt-in em processo local; não há ainda execução em três containers, publisher concorrente usando MiniStack real, retry transitório validado contra a fila real ou bootstrap de migrations em banco vazio na suíte.
+- O pipeline valida redelivery após crash/ACK, publishers concorrentes e retries da outbox contra PostgreSQL/MiniStack reais, além de inicializar o schema atual em banco vazio. Ainda não executa três containers de aplicação, reinicia toda a topologia Compose nem percorre upgrades históricos de migrations.
 
 Esses pontos não devem ser tratados como garantias de produção sem a implementação e validação adicionais descritas.

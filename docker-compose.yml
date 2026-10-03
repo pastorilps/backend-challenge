@@ -41,29 +41,6 @@ services:
     networks:
       - app_network
 
-  sqs-init:
-    image: amazon/aws-cli:2
-    entrypoint: ['/bin/sh', '/scripts/init-sqs.sh']
-    restart: 'no'
-    environment:
-      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-test}
-      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-test}
-      AWS_DEFAULT_REGION: ${AWS_REGION:-us-east-1}
-      SQS_ENDPOINT_URL: http://ministack:4566
-      SQS_QUEUE_NAME: ${SQS_QUEUE_NAME:-wager-transactions.fifo}
-      SQS_DLQ_NAME: ${SQS_DLQ_NAME:-wager-transactions-dlq.fifo}
-      SQS_EVENTS_QUEUE_NAME: ${SQS_EVENTS_QUEUE_NAME:-wager-events.fifo}
-      OUTBOX_BATCH_SIZE: ${OUTBOX_BATCH_SIZE:-10}
-      OUTBOX_POLL_INTERVAL_MS: ${OUTBOX_POLL_INTERVAL_MS:-1000}
-      SQS_MAX_ATTEMPTS: ${SQS_MAX_ATTEMPTS:-5}
-    volumes:
-      - ./docker/ministack/init-sqs.sh:/scripts/init-sqs.sh:ro
-    depends_on:
-      ministack:
-        condition: service_healthy
-    networks:
-      - app_network
-
   app:
     build:
       context: .
@@ -76,6 +53,7 @@ services:
       AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-test}
       AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-test}
       AWS_REGION: ${AWS_REGION:-us-east-1}
+      AWS_ACCOUNT_ID: ${AWS_ACCOUNT_ID:-000000000000}
       SQS_ENDPOINT_URL: http://ministack:4566
       SQS_QUEUE_URL: http://ministack:4566/${AWS_ACCOUNT_ID:-000000000000}/${SQS_QUEUE_NAME:-wager-transactions.fifo}
       SQS_DLQ_URL: http://ministack:4566/${AWS_ACCOUNT_ID:-000000000000}/${SQS_DLQ_NAME:-wager-transactions-dlq.fifo}
@@ -97,8 +75,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-      sqs-init:
-        condition: service_completed_successfully
+      ministack:
+        condition: service_healthy
     healthcheck:
       test:
         [
@@ -119,4 +97,3 @@ volumes:
 
 networks:
   app_network:
-    name: app_network

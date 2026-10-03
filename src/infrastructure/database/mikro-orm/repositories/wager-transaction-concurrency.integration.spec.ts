@@ -46,6 +46,7 @@ integration('PostgreSQL wager transaction concurrency', () => {
     for (let index = 0; index < 3; index += 1) {
       const orm = await MikroORM.init({
         clientUrl: getTestDatabaseUrl(),
+        ensureDatabase: false,
         entities: [
           WalletSchema,
           WagerTransactionSchema,
@@ -152,7 +153,12 @@ integration('PostgreSQL wager transaction concurrency', () => {
 
     const results = await Promise.all(
       Array.from({ length: 50 }, (_, index) =>
-        useCases[index % useCases.length].execute(payload, key, inboxReceipt),
+        new ProcessWagerTransactionUseCase(
+          new MikroOrmIdempotencyExecutor(
+            ormInstances[index % ormInstances.length].em.fork(),
+          ),
+          new MikroOrmWagerTransactionProcessor(),
+        ).execute(payload, key, inboxReceipt),
       ),
     );
     const persistedWallet = await ormInstances[0].em
@@ -459,7 +465,7 @@ integration('PostgreSQL wager transaction concurrency', () => {
     expect(persistedTransactions).toBe(1);
     expect(
       persistedWallets.map((wallet) => wallet.balanceAmount).sort(),
-    ).toEqual(['80.00', '100.00']);
+    ).toEqual(['100.00', '80.00']);
   }, 30_000);
 
   it('processes operations on different wallets concurrently without blocking correctness', async () => {
@@ -500,7 +506,13 @@ integration('PostgreSQL wager transaction concurrency', () => {
   }, 30_000);
 
   it('allows concurrent outbox publishers to claim separate rows only once', async () => {
+    await ormInstances[0].em.fork().nativeDelete(OutboxMessageOrmEntity, {
+      status: 'PENDING',
+    });
     const walletId = await createWallet('100.00');
+    const pendingCountBeforeOperation = await ormInstances[0].em
+      .fork()
+      .count(OutboxMessageOrmEntity, { status: 'PENDING' });
     const wallet = await ormInstances[0].em
       .fork()
       .findOneOrFail(WalletOrmEntity, { id: walletId });
@@ -550,15 +562,18 @@ integration('PostgreSQL wager transaction concurrency', () => {
         status: 'PUBLISHED',
       });
 
-    expect(publishedBodies).toHaveLength(2);
-    expect(pendingMessages).toHaveLength(0);
-    expect(publishedMessages).toHaveLength(2);
+    expect(publishedBodies).toHaveLength(pendingCountBeforeOperation + 2);
     expect(
       new Set(publishedBodies.map((body) => JSON.parse(body).eventId)).size,
-    ).toBe(2);
+    ).toBe(publishedBodies.length);
+    expect(pendingMessages).toHaveLength(0);
+    expect(publishedMessages).toHaveLength(2);
   }, 30_000);
 
   it('retries failed outbox publication with backoff and preserves the event ID', async () => {
+    await ormInstances[0].em.fork().nativeDelete(OutboxMessageOrmEntity, {
+      status: 'PENDING',
+    });
     const walletId = await createWallet('100.00');
     const wallet = await ormInstances[0].em
       .fork()

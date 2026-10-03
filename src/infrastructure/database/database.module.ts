@@ -30,6 +30,7 @@ class DatabaseLifecycle implements OnApplicationShutdown {
         }
         return MikroORM.init({
           clientUrl,
+          ensureDatabase: false,
           entities: [
             WalletSchema,
             WagerTransactionSchema,

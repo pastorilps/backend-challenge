@@ -1,5 +1,9 @@
 import { MikroORM } from '@mikro-orm/postgresql';
-import { SQSClient } from '@aws-sdk/client-sqs';
+import {
+  CreateQueueCommand,
+  DeleteQueueCommand,
+  SQSClient,
+} from '@aws-sdk/client-sqs';
 import { randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { resolve } from 'node:path';
@@ -43,17 +47,20 @@ const integration = integrationEnabled ? describe : describe.skip;
 integration('PostgreSQL and MiniStack integration', () => {
   let orm: MikroORM;
   let sqs: AwsSqsQueueClient;
+  let sqsClient: SQSClient;
+  let crashQueueUrl: string | undefined;
   let consumerName: string;
   let walletId: string | undefined;
   let messageId: string | undefined;
   let dlqMessageId: string | undefined;
+  const additionalInboxMessageIds: string[] = [];
 
   beforeAll(async () => {
     if (!databaseUrl || !endpoint || !sourceQueueUrl || !deadLetterQueueUrl) {
       throw new Error('Integration services are not fully configured.');
     }
     orm = await createOrm(databaseUrl);
-    const client = new SQSClient({
+    sqsClient = new SQSClient({
       endpoint,
       region: process.env.AWS_REGION ?? 'us-east-1',
       credentials: {
@@ -61,7 +68,21 @@ integration('PostgreSQL and MiniStack integration', () => {
         secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY ?? 'test',
       },
     });
-    sqs = new AwsSqsQueueClient(client);
+    sqs = new AwsSqsQueueClient(sqsClient);
+    const crashQueue = await sqsClient.send(
+      new CreateQueueCommand({
+        QueueName: `wager-crash-test-${randomUUID()}.fifo`,
+        Attributes: {
+          FifoQueue: 'true',
+          ContentBasedDeduplication: 'false',
+          VisibilityTimeout: '1',
+        },
+      }),
+    );
+    if (!crashQueue.QueueUrl) {
+      throw new Error('MiniStack did not return the crash queue URL.');
+    }
+    crashQueueUrl = crashQueue.QueueUrl;
     consumerName = `integration-${randomUUID()}`;
   }, 30_000);
 
@@ -69,16 +90,15 @@ integration('PostgreSQL and MiniStack integration', () => {
     try {
       if (walletId) {
         const em = orm.em.fork();
-        if (messageId) {
+        const inboxMessageIds = [
+          ...(messageId ? [messageId] : []),
+          ...(dlqMessageId ? [dlqMessageId] : []),
+          ...additionalInboxMessageIds,
+        ];
+        if (inboxMessageIds.length > 0) {
           await em.nativeDelete(InboxMessageOrmEntity, {
             consumerName,
-            messageId,
-          });
-        }
-        if (dlqMessageId) {
-          await em.nativeDelete(InboxMessageOrmEntity, {
-            consumerName,
-            messageId: dlqMessageId,
+            messageId: { $in: inboxMessageIds },
           });
         }
         const transactions = await em.find(WagerTransactionOrmEntity, {
@@ -98,6 +118,11 @@ integration('PostgreSQL and MiniStack integration', () => {
         await em.nativeDelete(WalletOrmEntity, { id: walletId });
       }
     } finally {
+      if (crashQueueUrl) {
+        await sqsClient.send(
+          new DeleteQueueCommand({ QueueUrl: crashQueueUrl }),
+        );
+      }
       await orm?.close(true);
       sqs?.onApplicationShutdown();
     }
@@ -107,8 +132,11 @@ integration('PostgreSQL and MiniStack integration', () => {
     if (!sourceQueueUrl || !deadLetterQueueUrl || !eventsQueueUrl) {
       throw new Error('Integration queue URLs are not fully configured.');
     }
+    if (!crashQueueUrl) {
+      throw new Error('MiniStack crash queue is not configured.');
+    }
     const createdWallet = await new CreateWalletUseCase(orm).execute({
-      playerId: `integration-player-${randomUUID()}`,
+      playerId: randomUUID(),
       initialBalance: { amount: '100.00', currency: 'BRL' },
     });
     walletId = createdWallet.id;
@@ -131,9 +159,9 @@ integration('PostgreSQL and MiniStack integration', () => {
         money: { amount: '10.00', currency: 'BRL' },
       },
     });
-    await sqs.publishEvent(sourceQueueUrl, body, walletId, messageId);
+    await sqs.publishEvent(crashQueueUrl, body, walletId, messageId);
 
-    const crashResult = await runCrashWorker(consumerName);
+    const crashResult = await runCrashWorker(consumerName, crashQueueUrl);
     expect(crashResult.code).toBe(73);
     expect(crashResult.stdout).toContain('COMMITTED_BEFORE_ACK');
     await orm.close(true);
@@ -142,7 +170,7 @@ integration('PostgreSQL and MiniStack integration', () => {
     }
     orm = await createOrm(databaseUrl);
 
-    const redeliveredMessage = await receiveRequired(sourceQueueUrl);
+    const redeliveredMessage = await receiveRequired(crashQueueUrl);
     expect(Number(redeliveredMessage.approximateReceiveCount)).toBeGreaterThan(
       1,
     );
@@ -151,7 +179,7 @@ integration('PostgreSQL and MiniStack integration', () => {
       new MikroOrmWagerTransactionProcessor(),
     );
     const consumer = new WagerTransactionSqsConsumer(sqs, useCase, {
-      queueUrl: sourceQueueUrl,
+      queueUrl: crashQueueUrl,
       deadLetterQueueUrl,
       consumerName,
       maxAttempts: 3,
@@ -161,6 +189,8 @@ integration('PostgreSQL and MiniStack integration', () => {
       waitTimeSeconds: 1,
     });
     await consumer.handleMessage(redeliveredMessage);
+    await sqsClient.send(new DeleteQueueCommand({ QueueUrl: crashQueueUrl }));
+    crashQueueUrl = undefined;
 
     const em = orm.em.fork();
     const persistedWallet = await em.findOneOrFail(WalletOrmEntity, {
@@ -207,21 +237,113 @@ integration('PostgreSQL and MiniStack integration', () => {
       pollIntervalMs: 1_000,
     });
     await expect(publisher.publishDueBatch()).resolves.toBe(2);
-    const publishedEvents = await Promise.all(
-      eventIds.map(async () => {
-        const event = await receiveRequired(eventsQueueUrl);
-        const payload = JSON.parse(event.body ?? '{}') as {
-          eventId?: string;
-        };
-        await deleteReceivedMessage(eventsQueueUrl, event);
-        return payload.eventId;
-      }),
-    );
+    const publishedEvents: (string | undefined)[] = [];
+    for (let index = 0; index < eventIds.length; index += 1) {
+      const event = await receiveRequired(eventsQueueUrl);
+      const payload = JSON.parse(event.body ?? '{}') as { eventId?: string };
+      await deleteReceivedMessage(eventsQueueUrl, event);
+      publishedEvents.push(payload.eventId);
+    }
     expect(
       publishedEvents.sort((left, right) =>
         (left ?? '').localeCompare(right ?? ''),
       ),
     ).toEqual(eventIds.sort((left, right) => left.localeCompare(right)));
+
+    const processingUseCase = new ProcessWagerTransactionUseCase(
+      new MikroOrmIdempotencyExecutor(orm.em),
+      new MikroOrmWagerTransactionProcessor(),
+    );
+    const concurrentExternalId = `concurrent-outbox-${randomUUID()}`;
+    await processingUseCase.execute(
+      {
+        providerId: 'integration-provider',
+        externalTransactionId: concurrentExternalId,
+        playerId: createdWallet.playerId,
+        walletId,
+        roundId: `round-${randomUUID()}`,
+        gameId: 'integration-game',
+        kind: WagerTransactionKind.Bet,
+        money: { amount: '1.00', currency: 'BRL' },
+      },
+      `concurrent-outbox-key-${randomUUID()}`,
+    );
+    const concurrentPublishers = [0, 1].map(
+      () =>
+        new SqsEventPublisher(orm.em.fork(), sqs, {
+          queueUrl: eventsQueueUrl,
+          batchSize: 1,
+          pollIntervalMs: 1_000,
+        }),
+    );
+    const concurrentPublishCounts = await Promise.all(
+      concurrentPublishers.map((concurrentPublisher) =>
+        concurrentPublisher.publishDueBatch(),
+      ),
+    );
+    expect(concurrentPublishCounts.reduce((total, count) => total + count, 0)).toBe(2);
+    const concurrentEvents: (string | undefined)[] = [];
+    for (const publishCount of concurrentPublishCounts) {
+      for (let index = 0; index < publishCount; index += 1) {
+        const event = await receiveRequired(eventsQueueUrl);
+        const payload = JSON.parse(event.body ?? '{}') as { eventId?: string };
+        await deleteReceivedMessage(eventsQueueUrl, event);
+        concurrentEvents.push(payload.eventId);
+      }
+    }
+    expect(new Set(concurrentEvents).size).toBe(2);
+
+    const retryExternalId = `retry-outbox-${randomUUID()}`;
+    await processingUseCase.execute(
+      {
+        providerId: 'integration-provider',
+        externalTransactionId: retryExternalId,
+        playerId: createdWallet.playerId,
+        walletId,
+        roundId: `round-${randomUUID()}`,
+        gameId: 'integration-game',
+        kind: WagerTransactionKind.Bet,
+        money: { amount: '1.00', currency: 'BRL' },
+      },
+      `retry-outbox-key-${randomUUID()}`,
+    );
+    const retryMessages = await orm.em.fork().find(OutboxMessageOrmEntity, {
+      aggregateId: walletId,
+      status: 'PENDING',
+    });
+    expect(retryMessages).toHaveLength(2);
+    const retryPublisher = new SqsEventPublisher(orm.em.fork(), sqs, {
+      queueUrl: `${endpoint}/000000000000/missing-events-${randomUUID()}.fifo`,
+      batchSize: 10,
+      pollIntervalMs: 1_000,
+    });
+    await expect(retryPublisher.publishDueBatch()).resolves.toBe(0);
+    const scheduledRetries = await orm.em.fork().find(OutboxMessageOrmEntity, {
+      id: { $in: retryMessages.map(({ id }) => id) },
+    });
+    expect(scheduledRetries.map(({ attempts }) => attempts)).toEqual([1, 1]);
+    expect(
+      scheduledRetries.every((message) => message.nextAttemptAt instanceof Date),
+    ).toBe(true);
+
+    const realQueueRetryPublisher = new SqsEventPublisher(orm.em.fork(), sqs, {
+      queueUrl: eventsQueueUrl,
+      batchSize: 10,
+      pollIntervalMs: 1_000,
+    });
+    await expect(
+      realQueueRetryPublisher.publishDueBatch(
+        new Date(Date.now() + 5_000),
+      ),
+    ).resolves.toBe(2);
+    const retriedEvents: (string | undefined)[] = [];
+    for (let index = 0; index < scheduledRetries.length; index += 1) {
+      const event = await receiveRequired(eventsQueueUrl);
+      const payload = JSON.parse(event.body ?? '{}') as { eventId?: string };
+      await deleteReceivedMessage(eventsQueueUrl, event);
+      retriedEvents.push(payload.eventId);
+    }
+    expect(new Set(retriedEvents).size).toBe(2);
 
     await sqs.publishEvent(
       sourceQueueUrl,
@@ -230,10 +352,101 @@ integration('PostgreSQL and MiniStack integration', () => {
       dlqMessageId,
     );
     const invalidMessage = await receiveRequired(sourceQueueUrl);
-    await consumer.handleMessage(invalidMessage);
+    const sourceConsumer = new WagerTransactionSqsConsumer(sqs, useCase, {
+      queueUrl: sourceQueueUrl,
+      deadLetterQueueUrl,
+      consumerName,
+      maxAttempts: 3,
+      retryBaseDelayMs: 100,
+      retryMaxDelayMs: 1_000,
+      visibilityTimeoutSeconds: 5,
+      waitTimeSeconds: 1,
+    });
+    await sourceConsumer.handleMessage(invalidMessage);
     const deadLetterMessage = await receiveRequired(deadLetterQueueUrl);
     expect(deadLetterMessage.body).toBe('{invalid-json');
     await deleteReceivedMessage(deadLetterQueueUrl, deadLetterMessage);
+
+    const referenceBetId = `reference-bet-${randomUUID()}`;
+    const refundMessageId = `out-of-order-refund-${randomUUID()}`;
+    additionalInboxMessageIds.push(refundMessageId);
+    const refundBody = JSON.stringify({
+      messageId: refundMessageId,
+      type: 'WagerTransactionRequested',
+      occurredAt: new Date().toISOString(),
+      data: {
+        providerId: 'integration-provider',
+        externalTransactionId: `refund-${randomUUID()}`,
+        idempotencyKey: `refund-key-${randomUUID()}`,
+        playerId: createdWallet.playerId,
+        walletId,
+        roundId: `round-${randomUUID()}`,
+        gameId: 'integration-game',
+        kind: WagerTransactionKind.Refund,
+        money: { amount: '2.00', currency: 'BRL' },
+        referenceExternalTransactionId: referenceBetId,
+      },
+    });
+    await sqs.publishEvent(sourceQueueUrl, refundBody, walletId, refundMessageId);
+    await sourceConsumer.handleMessage(await receiveRequired(sourceQueueUrl));
+    const pendingRefund = await orm.em.fork().findOneOrFail(
+      WagerTransactionOrmEntity,
+      { providerId: 'integration-provider', externalTransactionId: JSON.parse(refundBody).data.externalTransactionId },
+    );
+    expect(pendingRefund.status).toBe('PENDING_REFERENCE');
+
+    const referenceBetMessageId = `out-of-order-bet-${randomUUID()}`;
+    additionalInboxMessageIds.push(referenceBetMessageId);
+    const referenceBetBody = JSON.stringify({
+      messageId: referenceBetMessageId,
+      type: 'WagerTransactionRequested',
+      occurredAt: new Date().toISOString(),
+      data: {
+        providerId: 'integration-provider',
+        externalTransactionId: referenceBetId,
+        idempotencyKey: `reference-bet-key-${randomUUID()}`,
+        playerId: createdWallet.playerId,
+        walletId,
+        roundId: JSON.parse(refundBody).data.roundId,
+        gameId: 'integration-game',
+        kind: WagerTransactionKind.Bet,
+        money: { amount: '2.00', currency: 'BRL' },
+      },
+    });
+    await sqs.publishEvent(
+      sourceQueueUrl,
+      referenceBetBody,
+      walletId,
+      referenceBetMessageId,
+    );
+    await sourceConsumer.handleMessage(await receiveRequired(sourceQueueUrl));
+    const referenceProcessor = new MikroOrmWagerTransactionProcessor();
+    await expect(
+      referenceProcessor.reprocessPendingReferences(
+        orm.em.fork(),
+        new Date(Date.now() + 5_000),
+        10,
+      ),
+    ).resolves.toBe(1);
+    const processedRefund = await orm.em.fork().findOneOrFail(
+      WagerTransactionOrmEntity,
+      { id: pendingRefund.id },
+    );
+    expect(processedRefund.status).toBe('PROCESSED');
+
+    const finalWallet = await orm.em.fork().findOneOrFail(WalletOrmEntity, {
+      id: walletId,
+    });
+    const finalLedgerBalance = (await orm.em.fork().getConnection().execute(
+      `select coalesce(
+                sum(case when direction = 'CREDIT' then amount else -amount end),
+                0
+              )::text as balance
+         from wallet_ledger_entries
+        where wallet_id = ?`,
+      [walletId],
+    )) as Array<{ balance: string }>;
+    expect(finalLedgerBalance[0].balance).toBe(finalWallet.balanceAmount);
   }, 60_000);
 
   async function receiveRequired(
@@ -270,6 +483,7 @@ integration('PostgreSQL and MiniStack integration', () => {
 
   function runCrashWorker(
     workerConsumerName: string,
+    workerQueueUrl: string,
   ): Promise<{ code: number | null; stdout: string }> {
     return new Promise((resolveResult, reject) => {
       const worker = spawn(
@@ -289,6 +503,7 @@ integration('PostgreSQL and MiniStack integration', () => {
           env: {
             ...process.env,
             TEST_SQS_CONSUMER_NAME: workerConsumerName,
+            TEST_SQS_QUEUE_URL: workerQueueUrl,
           },
         },
       );
@@ -319,6 +534,7 @@ integration('PostgreSQL and MiniStack integration', () => {
 async function createOrm(clientUrl: string): Promise<MikroORM> {
   return MikroORM.init({
     clientUrl,
+    ensureDatabase: false,
     entities: [
       WalletSchema,
       WagerTransactionSchema,

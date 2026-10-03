@@ -1,4 +1,4 @@
-import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
+import { ApiHideProperty, ApiProperty } from '@nestjs/swagger';
 import { Type } from 'class-transformer';
 import {
   IsIn,
@@ -63,11 +63,7 @@ export class CreateWagerTransactionDto {
   @Type(() => MoneyDto)
   money!: MoneyDto;
 
-  @ApiPropertyOptional({
-    example: 'transaction-123',
-    maxLength: 255,
-    description: 'Required for REFUND and ROLLBACK.',
-  })
+  @ApiHideProperty()
   @ValidateIf(
     (input: CreateWagerTransactionDto, value: string | undefined) =>
       value !== undefined ||

@@ -109,6 +109,7 @@ function setup(options?: {
     find: vi.fn(async (entity: unknown) =>
       entity === WagerTransactionOrmEntity ? pendingTransactions : [],
     ),
+    getTransactionContext: () => ({}),
     getConnection: () => ({
       execute: executeAdvisoryLock,
     }),
@@ -705,6 +706,8 @@ describe('WagerTransactionProcessor business rules', () => {
           baseInput.externalTransactionId,
         ]),
       ],
+      'all',
+      {},
     );
     expect(state.findOne).toHaveBeenCalledWith(
       WalletOrmEntity,

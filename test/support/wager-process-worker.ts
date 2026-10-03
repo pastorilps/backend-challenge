@@ -34,6 +34,7 @@ async function main(): Promise<void> {
   const input = JSON.parse(rawInput) as WorkerInput;
   const orm = await MikroORM.init({
     clientUrl: input.databaseUrl,
+    ensureDatabase: false,
     entities: [
       WalletSchema,
       WagerTransactionSchema,

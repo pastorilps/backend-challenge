@@ -20,8 +20,10 @@ function existingTransaction(payloadHash: string): WagerTransactionOrmEntity {
 }
 
 function createExecutor(existing?: WagerTransactionOrmEntity) {
+  const transactionContext = {};
   const executeAdvisoryLock = vi.fn().mockResolvedValue(undefined);
   const transactionManager = {
+    getTransactionContext: vi.fn(() => transactionContext),
     getConnection: vi.fn(() => ({ execute: executeAdvisoryLock })),
     findOne: vi.fn().mockResolvedValue(existing ?? null),
     persist: vi.fn(),
@@ -66,6 +68,8 @@ describe('MikroOrmIdempotencyExecutor', () => {
     expect(executeAdvisoryLock).toHaveBeenCalledWith(
       'select pg_advisory_xact_lock(hashtextextended(?, 0))',
       [JSON.stringify(['idempotency', 'key-1'])],
+      'all',
+      transactionManager.getTransactionContext(),
     );
     expect(transactionManager.persist).not.toHaveBeenCalled();
   });

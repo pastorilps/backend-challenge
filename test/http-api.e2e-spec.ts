@@ -122,6 +122,9 @@ describe('HTTP API (e2e)', () => {
       '/providers/{providerId}/wagering/transactions/{externalTransactionId}',
     );
     expect(result.body.paths).toHaveProperty('/health/live');
+    expect(
+      result.body.components.schemas.CreateWagerTransactionDto.properties,
+    ).not.toHaveProperty('referenceExternalTransactionId');
   });
 
   it('requires an idempotency key and returns a structured client error', async () => {

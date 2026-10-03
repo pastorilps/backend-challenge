@@ -214,6 +214,13 @@ export class WagerTransactionSqsConsumer
           this.config.queueUrl,
           message.receiptHandle,
         );
+        this.logger.log(
+          JSON.stringify({
+            event: 'sqs_wager_duplicate_acknowledged',
+            ...messageContext,
+            receiveCount: this.receiveCount(message),
+          }),
+        );
         return;
       }
       if (

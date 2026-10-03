@@ -70,6 +70,10 @@ export class SqsEventPublisher implements OnModuleInit, OnModuleDestroy {
       return 0;
     }
     return this.entityManager.transactional(async (transactionManager) => {
+      const transactionContext = transactionManager.getTransactionContext();
+      if (!transactionContext) {
+        throw new Error('Outbox rows must be claimed inside a transaction.');
+      }
       const rows = (await transactionManager
         .getConnection()
         .execute(
@@ -81,6 +85,8 @@ export class SqsEventPublisher implements OnModuleInit, OnModuleDestroy {
             limit ?
             for update skip locked`,
           [now, config.batchSize],
+          'all',
+          transactionContext,
         )) as Array<{ id: string }>;
 
       let publishedCount = 0;

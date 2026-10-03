@@ -33,6 +33,7 @@ async function runMigrations(): Promise<void> {
 
   const orm = await MikroORM.init({
     clientUrl,
+    ensureDatabase: false,
     entities: [
       WalletSchema,
       WagerTransactionSchema,
