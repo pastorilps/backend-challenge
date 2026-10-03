@@ -77,6 +77,7 @@ function setup(options?: {
   const priorExternalTransaction = options?.priorExternalTransaction ?? null;
   const pendingTransactions = options?.pendingTransactions ?? [];
   const persisted: object[] = [];
+  const executeAdvisoryLock = vi.fn(async () => undefined);
   const findOne = vi.fn(async (entity: unknown, where: unknown) => {
     if (entity === WalletOrmEntity) {
       return wallet;
@@ -109,7 +110,7 @@ function setup(options?: {
       entity === WagerTransactionOrmEntity ? pendingTransactions : [],
     ),
     getConnection: () => ({
-      execute: vi.fn(async () => undefined),
+      execute: executeAdvisoryLock,
     }),
     transactional: vi.fn(
       async <Result>(callback: (em: EntityManager) => Promise<Result>) =>
@@ -121,7 +122,7 @@ function setup(options?: {
     flush: vi.fn(async () => undefined),
   } as unknown as EntityManager;
 
-  return { wallet, persisted, findOne, manager };
+  return { wallet, persisted, findOne, executeAdvisoryLock, manager };
 }
 
 function execute(
@@ -695,10 +696,23 @@ describe('WagerTransactionProcessor business rules', () => {
     const state = setup();
     await execute(state.manager);
 
+    expect(state.executeAdvisoryLock).toHaveBeenCalledWith(
+      'select pg_advisory_xact_lock(hashtextextended(?, 0))',
+      [
+        JSON.stringify([
+          'external-transaction',
+          baseInput.providerId,
+          baseInput.externalTransactionId,
+        ]),
+      ],
+    );
     expect(state.findOne).toHaveBeenCalledWith(
       WalletOrmEntity,
       { id: 'wallet-1' },
       { lockMode: LockMode.PESSIMISTIC_WRITE },
+    );
+    expect(state.executeAdvisoryLock.mock.invocationCallOrder[0]).toBeLessThan(
+      state.findOne.mock.invocationCallOrder[0],
     );
   });
 });

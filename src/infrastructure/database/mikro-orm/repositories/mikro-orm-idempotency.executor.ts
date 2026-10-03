@@ -6,6 +6,7 @@ import {
   WagerTransactionOperation,
 } from '../../../../application/wagering/process-wager-transaction/idempotency.types.js';
 import { WagerTransactionOrmEntity } from '../entities/wager-transaction.orm-entity.js';
+import { acquireTransactionAdvisoryLock } from './transaction-advisory-lock.js';
 
 export class MikroOrmIdempotencyExecutor extends WagerTransactionIdempotencyExecutor {
   constructor(private readonly entityManager: EntityManager) {
@@ -18,9 +19,10 @@ export class MikroOrmIdempotencyExecutor extends WagerTransactionIdempotencyExec
     operation: WagerTransactionOperation,
   ): Promise<IdempotentExecutionResult> {
     return this.entityManager.transactional(async (transactionManager) => {
-      await transactionManager.execute(
-        'select pg_advisory_xact_lock(hashtextextended(?, 0))',
-        [idempotencyKey],
+      await acquireTransactionAdvisoryLock(
+        transactionManager,
+        'idempotency',
+        idempotencyKey,
       );
 
       const existing = await transactionManager.findOne(

@@ -20,8 +20,9 @@ function existingTransaction(payloadHash: string): WagerTransactionOrmEntity {
 }
 
 function createExecutor(existing?: WagerTransactionOrmEntity) {
+  const executeAdvisoryLock = vi.fn().mockResolvedValue(undefined);
   const transactionManager = {
-    execute: vi.fn().mockResolvedValue(undefined),
+    getConnection: vi.fn(() => ({ execute: executeAdvisoryLock })),
     findOne: vi.fn().mockResolvedValue(existing ?? null),
     persist: vi.fn(),
     flush: vi.fn().mockResolvedValue(undefined),
@@ -39,12 +40,13 @@ function createExecutor(existing?: WagerTransactionOrmEntity) {
     ),
     entityManager,
     transactionManager,
+    executeAdvisoryLock,
   };
 }
 
 describe('MikroOrmIdempotencyExecutor', () => {
   it('returns the persisted original response as a replay without rerunning the operation', async () => {
-    const { executor, transactionManager } = createExecutor(
+    const { executor, executeAdvisoryLock, transactionManager } = createExecutor(
       existingTransaction('a'.repeat(64)),
     );
     const operation = vi.fn();
@@ -61,9 +63,9 @@ describe('MikroOrmIdempotencyExecutor', () => {
       replayed: true,
     });
     expect(operation).not.toHaveBeenCalled();
-    expect(transactionManager.execute).toHaveBeenCalledWith(
+    expect(executeAdvisoryLock).toHaveBeenCalledWith(
       'select pg_advisory_xact_lock(hashtextextended(?, 0))',
-      ['key-1'],
+      [JSON.stringify(['idempotency', 'key-1'])],
     );
     expect(transactionManager.persist).not.toHaveBeenCalled();
   });

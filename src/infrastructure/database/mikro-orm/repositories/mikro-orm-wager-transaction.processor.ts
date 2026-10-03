@@ -31,6 +31,7 @@ import {
   IdempotentOperationResult,
   ProcessWagerTransactionInput,
 } from '../../../../application/wagering/process-wager-transaction/idempotency.types.js';
+import { acquireTransactionAdvisoryLock } from './transaction-advisory-lock.js';
 
 const REFERENCE_RETRY_DELAYS_MS = [
   1_000, 2_000, 4_000, 8_000, 16_000, 32_000, 64_000, 128_000,
@@ -269,11 +270,12 @@ export class MikroOrmWagerTransactionProcessor
     payloadHash: string,
     transactionManager: EntityManager,
   ): Promise<IdempotentOperationResult> {
-    await transactionManager
-      .getConnection()
-      .execute('select pg_advisory_xact_lock(hashtextextended(?, 0))', [
-        `external:${input.providerId}:${input.externalTransactionId}`,
-      ]);
+    await acquireTransactionAdvisoryLock(
+      transactionManager,
+      'external-transaction',
+      input.providerId,
+      input.externalTransactionId,
+    );
 
     const walletEntity = await transactionManager.findOne(
       WalletOrmEntity,
