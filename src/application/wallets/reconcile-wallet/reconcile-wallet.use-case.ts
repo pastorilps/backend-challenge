@@ -1,5 +1,6 @@
 import { EntityManager, LockMode } from '@mikro-orm/postgresql';
 import { Logger } from '@nestjs/common';
+import { randomUUID } from 'node:crypto';
 import { AppError } from '../../../shared/errors/app.error.js';
 import { LedgerDirection } from '../../../domain/ledger/enums/ledger-direction.js';
 import { Money } from '../../../domain/wallet/value-objects/money.js';
@@ -69,7 +70,15 @@ export class ReconcileWalletUseCase {
       if (!result.consistent) {
         this.metrics.incrementMismatchCount();
         this.logger.error(
-          `Wallet reconciliation mismatch for ${walletId}: stored=${stored.toString()}, calculated=${calculated.toString()}, entries=${entries.length}`,
+          JSON.stringify({
+            event: 'wallet_reconciliation_mismatch',
+            correlationId: randomUUID(),
+            messageId: null,
+            transactionId: null,
+            walletId,
+            providerId: null,
+            checkedEntries: entries.length,
+          }),
         );
       }
       return result;

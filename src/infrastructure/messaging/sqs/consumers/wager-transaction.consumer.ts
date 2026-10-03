@@ -13,6 +13,7 @@ import { InboxMessageAlreadyProcessedError } from '../../../../domain/inbox/erro
 import { InboxPayloadConflictError } from '../../../../domain/inbox/errors/inbox-payload-conflict.error.js';
 import { ProcessWagerTransactionUseCase } from '../../../../application/wagering/process-wager-transaction/process-wager-transaction.use-case.js';
 import { CreateWagerTransactionDto } from '../../../../presentation/http/wagering/dto/create-wager-transaction.dto.js';
+import { ApplicationMetrics } from '../../../../application/observability/application-metrics.js';
 import {
   SqsQueueClient,
   SqsReceivedMessage,
@@ -127,6 +128,7 @@ export class WagerTransactionSqsConsumer
     private readonly queueClient: SqsQueueClient,
     private readonly processWagerTransaction: ProcessWagerTransactionUseCase,
     private readonly config?: WagerTransactionSqsConsumerConfig,
+    private readonly metrics?: ApplicationMetrics,
   ) {}
 
   onModuleInit(): void {
@@ -155,18 +157,33 @@ export class WagerTransactionSqsConsumer
       throw new Error('Received SQS message without a receipt handle.');
     }
 
+    let messageContext = {
+      messageId: message.messageId ?? null,
+      correlationId: message.messageId ?? null,
+      transactionId: null as string | null,
+      walletId: null as string | null,
+      providerId: null as string | null,
+    };
     try {
       const envelope = await this.parseMessage(message.body);
+      messageContext = {
+        messageId: envelope.messageId,
+        correlationId: envelope.messageId,
+        transactionId: null,
+        walletId: envelope.data.walletId,
+        providerId: envelope.data.providerId,
+      };
       const payloadHash = createHash('sha256')
         .update(message.body ?? '', 'utf8')
         .digest('hex');
       const receiveCount = this.receiveCount(message);
-      await this.processWagerTransaction.execute(
+      const result = await this.processWagerTransaction.execute(
         envelope.data,
         envelope.data.idempotencyKey,
         {
           consumerName: this.config.consumerName,
           messageId: envelope.messageId,
+          correlationId: envelope.messageId,
           payloadHash,
           payloadJson: envelope.raw,
           attempts: receiveCount,
@@ -179,7 +196,8 @@ export class WagerTransactionSqsConsumer
       this.logger.log(
         JSON.stringify({
           event: 'sqs_wager_message_acknowledged',
-          messageId: envelope.messageId,
+          ...messageContext,
+          transactionId: result.response.transactionId,
           receiveCount,
         }),
       );
@@ -188,7 +206,7 @@ export class WagerTransactionSqsConsumer
         error instanceof SqsMessageValidationError ||
         error instanceof InboxPayloadConflictError
       ) {
-        await this.moveToDeadLetterQueue(message);
+        await this.moveToDeadLetterQueue(message, messageContext);
         return;
       }
       if (error instanceof InboxMessageAlreadyProcessedError) {
@@ -210,7 +228,7 @@ export class WagerTransactionSqsConsumer
         this.logger.warn(
           JSON.stringify({
             event: 'sqs_wager_business_error_acknowledged',
-            messageId: message.messageId,
+            ...messageContext,
             code: error.code,
           }),
         );
@@ -219,7 +237,7 @@ export class WagerTransactionSqsConsumer
 
       const receiveCount = this.receiveCount(message);
       if (receiveCount >= this.config.maxAttempts) {
-        await this.moveToDeadLetterQueue(message);
+        await this.moveToDeadLetterQueue(message, messageContext);
         return;
       }
       const delayMs = Math.min(
@@ -234,10 +252,11 @@ export class WagerTransactionSqsConsumer
         message.receiptHandle,
         visibilityTimeoutSeconds,
       );
+      this.metrics?.incrementRetry('sqs');
       this.logger.error(
         JSON.stringify({
           event: 'sqs_wager_transient_error_scheduled',
-          messageId: message.messageId,
+          ...messageContext,
           receiveCount,
           visibilityTimeoutSeconds,
           errorName: error instanceof Error ? error.name : 'UnknownError',
@@ -342,6 +361,13 @@ export class WagerTransactionSqsConsumer
 
   private async moveToDeadLetterQueue(
     message: SqsReceivedMessage,
+    context = {
+      messageId: message.messageId ?? null,
+      correlationId: message.messageId ?? null,
+      transactionId: null as string | null,
+      walletId: null as string | null,
+      providerId: null as string | null,
+    },
   ): Promise<void> {
     if (!this.config || !message.receiptHandle) {
       throw new Error(
@@ -358,6 +384,7 @@ export class WagerTransactionSqsConsumer
       message.messageGroupId ?? 'wager-transactions',
       deduplicationId,
     );
+    this.metrics?.incrementDeadLetterCount();
     await this.queueClient.deleteMessage(
       this.config.queueUrl,
       message.receiptHandle,
@@ -365,7 +392,7 @@ export class WagerTransactionSqsConsumer
     this.logger.warn(
       JSON.stringify({
         event: 'sqs_wager_message_sent_to_dlq',
-        messageId: message.messageId,
+        ...context,
         receiveCount: message.approximateReceiveCount,
       }),
     );

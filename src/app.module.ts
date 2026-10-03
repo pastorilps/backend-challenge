@@ -82,35 +82,43 @@ export const { ObserveModule, ObserveInstrument } = createObserveModule();
     },
     {
       provide: ProcessWagerTransactionUseCase,
-      useFactory: (orm: MikroORM) =>
+      useFactory: (orm: MikroORM, metrics: AppMetrics) =>
         new ProcessWagerTransactionUseCase(
-          new MikroOrmIdempotencyExecutor(orm.em),
+          new MikroOrmIdempotencyExecutor(orm.em, metrics),
           new MikroOrmWagerTransactionProcessor(),
+          metrics,
         ),
-      inject: [DATABASE_ORM],
+      inject: [DATABASE_ORM, AppMetrics],
     },
     {
       provide: WagerTransactionSqsConsumer,
       useFactory: (
         queueClient: SqsQueueClient,
         processWagerTransaction: ProcessWagerTransactionUseCase,
+        metrics: AppMetrics,
       ) =>
         new WagerTransactionSqsConsumer(
           queueClient,
           processWagerTransaction,
           loadWagerTransactionSqsConsumerConfig(),
+          metrics,
         ),
-      inject: [SQS_QUEUE_CLIENT, ProcessWagerTransactionUseCase],
+      inject: [SQS_QUEUE_CLIENT, ProcessWagerTransactionUseCase, AppMetrics],
     },
     {
       provide: SqsEventPublisher,
-      useFactory: (orm: MikroORM, queueClient: SqsQueueClient) =>
+      useFactory: (
+        orm: MikroORM,
+        queueClient: SqsQueueClient,
+        metrics: AppMetrics,
+      ) =>
         new SqsEventPublisher(
           orm.em,
           queueClient,
           loadSqsOutboxPublisherConfig(),
+          metrics,
         ),
-      inject: [DATABASE_ORM, SQS_QUEUE_CLIENT],
+      inject: [DATABASE_ORM, SQS_QUEUE_CLIENT, AppMetrics],
     },
   ],
 })

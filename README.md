@@ -134,6 +134,19 @@ In production applications, observability is essential for understanding how you
 - **SLA monitoring:** Track service-level objectives and identify when your application is approaching or exceeding defined thresholds.
 - **Alarms and alerts:** Set up alerts for critical errors, performance degradation, SLA violations, and other anomalies so your team can react quickly.
 
+Application metrics are registered through `AppMetrics` and exported by NestJS Observe:
+
+- `wager_transactions_total{status}` — completed operation responses by final state.
+- `wager_transaction_duplicates_total` — idempotent replays and external/idempotency conflicts.
+- `messaging_retries_total{source}` — scheduled SQS and outbox retries.
+- `sqs_messages_dead_lettered_total` — messages sent to the DLQ.
+- `database_lock_conflicts_total` — PostgreSQL deadlocks and lock/serialization timeouts detected by the idempotency executor.
+- `outbox_lag_ms` — event age at successful publication.
+- `wager_processing_latency_ms` — wager use-case duration, including errors.
+- `wallet_reconciliation_mismatches_total` — wallet reconciliation mismatches.
+
+Business and messaging logs are JSON and include `correlationId`, `messageId`, `transactionId`, `walletId`, and `providerId` where available. They record identifiers, status, retry counts, and error codes/names only; request bodies, money values, balances, credentials, and idempotency keys are not logged. `GET /health/live` checks process liveness; `GET /health/ready` independently reports PostgreSQL and MiniStack availability.
+
 This project is already instrumented. Create a free account at [observe.nestjs.com](https://observe.nestjs.com), add an application, and paste the generated app key and secret into the `ObserveModule.forRoot()` call in `src/app.module.ts`.
 
 The free plan needs no payment details and covers 300,000 events a month. You can also browse the [live demo](https://www.observe-demo.nestjs.com/dashboard) first - the whole dashboard over a busy service's data, with nothing to install.

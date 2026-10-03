@@ -12,9 +12,13 @@ import { InboxMessageOrmEntity } from '../entities/inbox-message.orm-entity.js';
 import { AppError } from '../../../../shared/errors/app.error.js';
 import { InboxPayloadConflictError } from '../../../../domain/inbox/errors/inbox-payload-conflict.error.js';
 import { InboxMessageAlreadyProcessedError } from '../../../../domain/inbox/errors/inbox-message-already-processed.error.js';
+import { ApplicationMetrics } from '../../../../application/observability/application-metrics.js';
 
 export class MikroOrmIdempotencyExecutor extends WagerTransactionIdempotencyExecutor {
-  constructor(private readonly entityManager: EntityManager) {
+  constructor(
+    private readonly entityManager: EntityManager,
+    private readonly metrics?: ApplicationMetrics,
+  ) {
     super();
   }
 
@@ -131,6 +135,9 @@ export class MikroOrmIdempotencyExecutor extends WagerTransactionIdempotencyExec
         return executionResult;
       });
     } catch (error) {
+      if (isDatabaseLockConflict(error)) {
+        this.metrics?.incrementLockConflictCount();
+      }
       if (
         inboxReceipt &&
         error instanceof AppError &&
@@ -191,4 +198,29 @@ export class MikroOrmIdempotencyExecutor extends WagerTransactionIdempotencyExec
       await transactionManager.flush();
     });
   }
+}
+
+function isDatabaseLockConflict(error: unknown): boolean {
+  let current: unknown = error;
+  while (current !== null && typeof current === 'object') {
+    if (
+      current instanceof Error &&
+      /deadlock|lockwaittimeout|lock_wait_timeout|lock_not_available/i.test(
+        current.name,
+      )
+    ) {
+      return true;
+    }
+    const code = Reflect.get(current, 'code');
+    if (
+      code === '40P01' ||
+      code === '55P03' ||
+      code === '40001' ||
+      code === '57014'
+    ) {
+      return true;
+    }
+    current = Reflect.get(current, 'cause');
+  }
+  return false;
 }

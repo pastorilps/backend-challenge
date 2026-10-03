@@ -3,6 +3,7 @@ import { Logger, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
 import { OutboxMessage } from '../../../../domain/outbox/entities/outbox-message.js';
 import { OutboxMessageOrmEntity } from '../../../database/mikro-orm/entities/outbox-message.orm-entity.js';
 import { SqsQueueClient } from '../sqs-queue-client.js';
+import { ApplicationMetrics } from '../../../../application/observability/application-metrics.js';
 
 export interface SqsOutboxPublisherConfig {
   queueUrl: string;
@@ -44,6 +45,7 @@ export class SqsEventPublisher implements OnModuleInit, OnModuleDestroy {
     private readonly entityManager: EntityManager,
     private readonly queueClient: SqsQueueClient,
     private readonly config?: SqsOutboxPublisherConfig,
+    private readonly metrics?: ApplicationMetrics,
   ) {}
 
   onModuleInit(): void {
@@ -128,9 +130,15 @@ export class SqsEventPublisher implements OnModuleInit, OnModuleDestroy {
           entity.nextAttemptAt = null;
           entity.attempts = message.attempts;
           publishedCount += 1;
+          const lagMs = Math.max(
+            0,
+            now.getTime() - message.occurredAt.getTime(),
+          );
+          this.metrics?.observeOutboxLag(lagMs);
           this.logger.log(
             JSON.stringify({
               event: 'outbox_event_published',
+              ...eventLogContext(message.payload, message.aggregateId),
               outboxMessageId: message.id,
               eventId,
               eventType: message.eventType,
@@ -138,7 +146,7 @@ export class SqsEventPublisher implements OnModuleInit, OnModuleDestroy {
               attempts: message.attempts,
               occurredAt: message.occurredAt.toISOString(),
               publishedAt: now.toISOString(),
-              lagMs: Math.max(0, now.getTime() - message.occurredAt.getTime()),
+              lagMs,
             }),
           );
         } catch (error) {
@@ -152,9 +160,11 @@ export class SqsEventPublisher implements OnModuleInit, OnModuleDestroy {
           entity.status = 'PENDING';
           entity.attempts = message.attempts;
           entity.nextAttemptAt = nextAttemptAt;
+          this.metrics?.incrementRetry('outbox');
           this.logger.error(
             JSON.stringify({
               event: 'outbox_event_publish_failed',
+              ...eventLogContext(message.payload, message.aggregateId),
               outboxMessageId: message.id,
               eventId,
               eventType: message.eventType,
@@ -189,6 +199,36 @@ export class SqsEventPublisher implements OnModuleInit, OnModuleDestroy {
       await delay(this.config.pollIntervalMs, this.stopController.signal);
     }
   }
+}
+
+function eventLogContext(
+  payload: Readonly<Record<string, unknown>>,
+  aggregateId: string,
+): {
+  correlationId: string | null;
+  messageId: null;
+  transactionId: string | null;
+  walletId: string;
+  providerId: string | null;
+} {
+  const data = payload.data;
+  const eventData =
+    data !== null && typeof data === 'object'
+      ? (data as Record<string, unknown>)
+      : {};
+  return {
+    correlationId:
+      typeof payload.correlationId === 'string' ? payload.correlationId : null,
+    messageId: null,
+    transactionId:
+      typeof eventData.transactionId === 'string'
+        ? eventData.transactionId
+        : null,
+    walletId:
+      typeof eventData.walletId === 'string' ? eventData.walletId : aggregateId,
+    providerId:
+      typeof eventData.providerId === 'string' ? eventData.providerId : null,
+  };
 }
 
 function positiveInteger(

@@ -39,6 +39,7 @@ export interface IdempotentExecutionResult {
 export interface WagerTransactionInboxReceipt {
   consumerName: string;
   messageId: string;
+  correlationId?: string;
   payloadHash: string;
   payloadJson: Readonly<Record<string, unknown>>;
   attempts: number;

@@ -9,8 +9,10 @@ import {
 } from './idempotency.types.js';
 import { ProcessWagerTransactionUseCase } from './process-wager-transaction.use-case.js';
 import { WagerTransactionProcessor } from './wager-transaction-processor.js';
+import { ApplicationMetrics } from '../../observability/application-metrics.js';
 
 class TestIdempotencyExecutor extends WagerTransactionIdempotencyExecutor {
+  replayed = false;
   received?: {
     key: string;
     hash: string;
@@ -37,7 +39,7 @@ class TestIdempotencyExecutor extends WagerTransactionIdempotencyExecutor {
         balance: { amount: '75.00', currency: 'BRL' },
         idempotentReplay: false,
       },
-      replayed: false,
+      replayed: this.replayed,
     });
   }
 }
@@ -47,6 +49,23 @@ class TestProcessor extends WagerTransactionProcessor {
 }
 
 describe('ProcessWagerTransactionUseCase idempotency input', () => {
+  function createMetrics(): ApplicationMetrics & {
+    recordTransactionStatus: ReturnType<typeof vi.fn>;
+    incrementDuplicateCount: ReturnType<typeof vi.fn>;
+    observeProcessingLatency: ReturnType<typeof vi.fn>;
+  } {
+    return {
+      incrementMismatchCount: vi.fn(() => {}),
+      recordTransactionStatus: vi.fn((_status: string) => {}),
+      incrementDuplicateCount: vi.fn(() => {}),
+      incrementRetry: vi.fn((_source: 'sqs' | 'outbox') => {}),
+      incrementDeadLetterCount: vi.fn(() => {}),
+      incrementLockConflictCount: vi.fn(() => {}),
+      observeProcessingLatency: vi.fn((_milliseconds: number) => {}),
+      observeOutboxLag: vi.fn((_milliseconds: number) => {}),
+    };
+  }
+
   it('hashes normalized business fields and keeps the header key out of the payload hash', async () => {
     const executor = new TestIdempotencyExecutor();
     const processor = new TestProcessor();
@@ -81,7 +100,7 @@ describe('ProcessWagerTransactionUseCase idempotency input', () => {
       new TestProcessor(),
     );
 
-    expect(() =>
+    await expect(
       useCase.execute(
         {
           providerId: 'provider-1',
@@ -95,7 +114,7 @@ describe('ProcessWagerTransactionUseCase idempotency input', () => {
         },
         '',
       ),
-    ).toThrow();
+    ).rejects.toThrow();
     expect(executor.received).toBeUndefined();
   });
 
@@ -129,5 +148,61 @@ describe('ProcessWagerTransactionUseCase idempotency input', () => {
     );
 
     expect(executor.received?.inboxReceipt).toEqual(inboxReceipt);
+  });
+
+  it('records the final status and processing latency', async () => {
+    const executor = new TestIdempotencyExecutor();
+    const metrics = createMetrics();
+    const useCase = new ProcessWagerTransactionUseCase(
+      executor,
+      new TestProcessor(),
+      metrics,
+    );
+    const input = {
+      providerId: 'provider-1',
+      externalTransactionId: 'external-1',
+      playerId: 'player-1',
+      walletId: 'wallet-1',
+      roundId: 'round-1',
+      gameId: 'game-1',
+      kind: WagerTransactionKind.Bet,
+      money: { amount: '25.00', currency: 'BRL' },
+    } as const;
+
+    await useCase.execute(input, 'key-1');
+
+    expect(metrics.recordTransactionStatus).toHaveBeenCalledWith(
+      WagerTransactionStatus.Processed,
+    );
+    expect(metrics.observeProcessingLatency).toHaveBeenCalledWith(
+      expect.any(Number),
+    );
+  });
+
+  it('counts idempotent replays as detected duplicates', async () => {
+    const executor = new TestIdempotencyExecutor();
+    executor.replayed = true;
+    const metrics = createMetrics();
+    const useCase = new ProcessWagerTransactionUseCase(
+      executor,
+      new TestProcessor(),
+      metrics,
+    );
+
+    await useCase.execute(
+      {
+        providerId: 'provider-1',
+        externalTransactionId: 'external-1',
+        playerId: 'player-1',
+        walletId: 'wallet-1',
+        roundId: 'round-1',
+        gameId: 'game-1',
+        kind: WagerTransactionKind.Bet,
+        money: { amount: '25.00', currency: 'BRL' },
+      },
+      'key-1',
+    );
+
+    expect(metrics.incrementDuplicateCount).toHaveBeenCalledOnce();
   });
 });

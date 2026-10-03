@@ -9,6 +9,7 @@ import {
   WagerTransactionOperation,
 } from '../../../../application/wagering/process-wager-transaction/idempotency.types.js';
 import { WagerTransactionProcessor } from '../../../../application/wagering/process-wager-transaction/wager-transaction-processor.js';
+import { ApplicationMetrics } from '../../../../application/observability/application-metrics.js';
 import { SqsQueueClient } from '../sqs-queue-client.js';
 import {
   loadWagerTransactionSqsConsumerConfig,
@@ -100,6 +101,22 @@ function createUseCase(): ProcessWagerTransactionUseCase {
   );
 }
 
+function createMetrics(): ApplicationMetrics & {
+  incrementRetry: ReturnType<typeof vi.fn>;
+  incrementDeadLetterCount: ReturnType<typeof vi.fn>;
+} {
+  return {
+    incrementMismatchCount: vi.fn(() => {}),
+    recordTransactionStatus: vi.fn((_status: string) => {}),
+    incrementDuplicateCount: vi.fn(() => {}),
+    incrementRetry: vi.fn((_source: 'sqs' | 'outbox') => {}),
+    incrementDeadLetterCount: vi.fn(() => {}),
+    incrementLockConflictCount: vi.fn(() => {}),
+    observeProcessingLatency: vi.fn((_milliseconds: number) => {}),
+    observeOutboxLag: vi.fn((_milliseconds: number) => {}),
+  };
+}
+
 function receivedMessage(
   messageBody = body,
   approximateReceiveCount = '1',
@@ -180,10 +197,12 @@ describe('WagerTransactionSqsConsumer', () => {
   it('sends malformed messages to the FIFO DLQ before deleting the source', async () => {
     const { client, deleteMessage, sendToDeadLetterQueue } =
       createQueueClient();
+    const metrics = createMetrics();
     const consumer = new WagerTransactionSqsConsumer(
       client,
       createUseCase(),
       config,
+      metrics,
     );
 
     await consumer.handleMessage(receivedMessage('{not-json'));
@@ -195,6 +214,7 @@ describe('WagerTransactionSqsConsumer', () => {
       expect.stringMatching(/^[a-f\d]{64}$/),
     );
     expect(deleteMessage).toHaveBeenCalledWith(config.queueUrl, 'receipt-1');
+    expect(metrics.incrementDeadLetterCount).toHaveBeenCalledOnce();
     expect(sendToDeadLetterQueue.mock.invocationCallOrder[0]).toBeLessThan(
       deleteMessage.mock.invocationCallOrder[0],
     );
@@ -203,12 +223,14 @@ describe('WagerTransactionSqsConsumer', () => {
   it('uses exponential visibility backoff for transient failures', async () => {
     const { client, changeMessageVisibility, deleteMessage } =
       createQueueClient();
+    const metrics = createMetrics();
     const useCase = createUseCase();
     vi.spyOn(useCase, 'execute').mockRejectedValue(new Error('Database timeout.'));
     const consumer = new WagerTransactionSqsConsumer(
       client,
       useCase,
       config,
+      metrics,
     );
 
     await consumer.handleMessage(receivedMessage(body, '2'));
@@ -219,6 +241,7 @@ describe('WagerTransactionSqsConsumer', () => {
       2,
     );
     expect(deleteMessage).not.toHaveBeenCalled();
+    expect(metrics.incrementRetry).toHaveBeenCalledWith('sqs');
   });
 
   it('moves transient failures to the DLQ at the attempt limit', async () => {
