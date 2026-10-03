@@ -2,6 +2,7 @@ import { MikroORM } from '@mikro-orm/postgresql';
 import { spawn } from 'node:child_process';
 import { resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
+import type { ChildProcess } from 'node:child_process';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { ProcessWagerTransactionUseCase } from '../../../../application/wagering/process-wager-transaction/process-wager-transaction.use-case.js';
 import { CreateWalletUseCase } from '../../../../application/wallets/create-wallet/create-wallet.use-case.js';
@@ -34,7 +35,38 @@ function getTestDatabaseUrl(): string {
   return url;
 }
 
+function getPositiveInteger(
+  name: string,
+  defaultValue: number,
+  minimum = 1,
+): number {
+  const rawValue = process.env[name];
+  if (rawValue === undefined) {
+    return defaultValue;
+  }
+  const value = Number(rawValue);
+  if (!Number.isSafeInteger(value) || value < minimum) {
+    throw new Error(
+      `${name} must be an integer greater than or equal to ${minimum}.`,
+    );
+  }
+  return value;
+}
+
 const integration = process.env.TEST_DATABASE_URL ? describe : describe.skip;
+const multiInstanceRequestCount = getPositiveInteger(
+  'TEST_MULTI_INSTANCE_REQUESTS',
+  50,
+);
+const multiInstanceApplicationCount = getPositiveInteger(
+  'TEST_MULTI_INSTANCE_COUNT',
+  3,
+  2,
+);
+const multiInstancePoolMax = getPositiveInteger(
+  'TEST_MULTI_INSTANCE_POOL_MAX',
+  Math.max(1, Math.min(10, Math.floor(40 / multiInstanceApplicationCount))),
+);
 
 integration('PostgreSQL wager transaction concurrency', () => {
   const ormInstances: MikroORM[] = [];
@@ -243,6 +275,97 @@ integration('PostgreSQL wager transaction concurrency', () => {
     expect(ledgerEntries).toHaveLength(1);
     expect(inbox.status).toBe('PROCESSED');
   }, 60_000);
+
+  it(
+    'processes concurrent HTTP wagers across multiple complete application instances',
+    async () => {
+      const walletId = await createWallet('100.00');
+      const wallet = await ormInstances[0].em
+        .fork()
+        .findOneOrFail(WalletOrmEntity, { id: walletId });
+      const applicationInstances: ApplicationInstance[] = [];
+      try {
+        for (let index = 0; index < multiInstanceApplicationCount; index += 1) {
+          applicationInstances.push(await startApplicationInstance());
+        }
+
+        expect(new Set(applicationInstances.map(({ pid }) => pid)).size).toBe(
+          multiInstanceApplicationCount,
+        );
+        const externalTransactionId = `http-multi-instance-${randomUUID()}`;
+        const idempotencyKey = `http-multi-instance-key-${randomUUID()}`;
+        const payload = {
+          ...request(walletId, externalTransactionId, '1.00'),
+          playerId: wallet.playerId,
+        };
+        const responses = await Promise.all(
+          Array.from({ length: multiInstanceRequestCount }, (_, index) =>
+            fetch(
+              `${applicationInstances[index % applicationInstances.length].url}/wagering/transactions`,
+              {
+                method: 'POST',
+                headers: {
+                  'content-type': 'application/json',
+                  'idempotency-key': idempotencyKey,
+                },
+                body: JSON.stringify(payload),
+              },
+            ),
+          ),
+        );
+        const responseBodies = await Promise.all(
+          responses.map(async (response) => ({
+            status: response.status,
+            body: (await response.json()) as {
+              idempotentReplay: boolean;
+              status: string;
+            },
+          })),
+        );
+        const failedResponse = responseBodies.find(
+          ({ status }) => status !== 200,
+        );
+        if (failedResponse) {
+          throw new Error(
+            `Multi-instance endpoint returned HTTP ${failedResponse.status}: ${JSON.stringify(failedResponse.body)}\n${applicationInstances.map(({ pid, diagnostics }) => `Instance ${pid}: ${diagnostics()}`).join('\n')}`,
+          );
+        }
+        const persistedWallet = await ormInstances[0].em
+          .fork()
+          .findOneOrFail(WalletOrmEntity, { id: walletId });
+        const transactionCount = await ormInstances[0].em
+          .fork()
+          .count(WagerTransactionOrmEntity, {
+            providerId: payload.providerId,
+            externalTransactionId,
+          });
+        const ledgerCount = await ormInstances[0].em
+          .fork()
+          .count(WalletLedgerEntryOrmEntity, { wallet: walletId });
+
+        expect(responseBodies.map(({ status }) => status)).toEqual(
+          Array.from({ length: multiInstanceRequestCount }, () => 200),
+        );
+        expect(
+          responseBodies.filter(({ body }) => !body.idempotentReplay),
+        ).toHaveLength(1);
+        expect(
+          responseBodies.filter(({ body }) => body.idempotentReplay),
+        ).toHaveLength(multiInstanceRequestCount - 1);
+        expect(persistedWallet.balanceAmount).toBe('99.00');
+        expect(transactionCount).toBe(1);
+        expect(ledgerCount).toBe(1);
+      } finally {
+        await Promise.all(
+          applicationInstances.map((instance) => instance.stop()),
+        );
+      }
+    },
+    Math.max(
+      60_000,
+      multiInstanceApplicationCount * 30_000 + multiInstanceRequestCount * 500,
+    ),
+  );
 
   it('persists terminal business failures in the inbox after rolling back finance', async () => {
     const walletId = await createWallet('100.00');
@@ -636,6 +759,125 @@ integration('PostgreSQL wager transaction concurrency', () => {
     expect(publishedEventIds).toContain(failedEventId);
   }, 30_000);
 });
+
+interface ApplicationInstance {
+  pid: number;
+  url: string;
+  diagnostics: () => string;
+  stop: () => Promise<void>;
+}
+
+async function startApplicationInstance(): Promise<ApplicationInstance> {
+  const child = spawn(
+    process.execPath,
+    [
+      '--import',
+      'tsx',
+      resolve(
+        process.cwd(),
+        'test',
+        'support',
+        'application-instance-worker.ts',
+      ),
+    ],
+    {
+      cwd: process.cwd(),
+      env: {
+        ...process.env,
+        DATABASE_URL: getTestDatabaseUrl(),
+        DATABASE_POOL_MAX: String(multiInstancePoolMax),
+        PORT: '0',
+        SQS_QUEUE_URL: '',
+        SQS_DLQ_URL: '',
+        SQS_EVENTS_QUEUE_URL: '',
+      },
+      stdio: ['pipe', 'pipe', 'pipe'],
+    },
+  );
+
+  let output = '';
+  const ready = await new Promise<{ pid: number; port: number }>(
+    (resolveReady, reject) => {
+      const timeout = setTimeout(() => {
+        child.kill();
+        reject(
+          new Error(
+            `Application instance ${child.pid} did not start. ${output}`,
+          ),
+        );
+      }, 30_000);
+      const settle = (callback: () => void) => {
+        clearTimeout(timeout);
+        callback();
+      };
+      child.stdout.setEncoding('utf8');
+      child.stderr.setEncoding('utf8');
+      child.stdout.on('data', (chunk: string) => {
+        output = appendChildOutput(output, chunk);
+        const readyLine = output
+          .split(/\r?\n/)
+          .find((line) => line.startsWith('APPLICATION_INSTANCE_READY:'));
+        if (readyLine) {
+          settle(() => {
+            resolveReady(
+              JSON.parse(
+                readyLine.slice('APPLICATION_INSTANCE_READY:'.length),
+              ) as { pid: number; port: number },
+            );
+          });
+        }
+      });
+      child.stderr.on('data', (chunk: string) => {
+        output = appendChildOutput(output, chunk);
+      });
+      child.on('error', (error) => {
+        settle(() => reject(error));
+      });
+      child.on('close', (code) => {
+        settle(() =>
+          reject(
+            new Error(
+              `Application instance exited with ${code} before readiness. ${output}`,
+            ),
+          ),
+        );
+      });
+    },
+  );
+
+  return {
+    pid: ready.pid,
+    url: `http://127.0.0.1:${ready.port}`,
+    diagnostics: () => output,
+    stop: () => stopApplicationInstance(child),
+  };
+}
+
+function appendChildOutput(previous: string, chunk: string): string {
+  const output = previous + chunk;
+  return output.length > 50_000 ? output.slice(-50_000) : output;
+}
+
+function stopApplicationInstance(child: ChildProcess): Promise<void> {
+  if (child.exitCode !== null || child.killed) {
+    return Promise.resolve();
+  }
+  return new Promise((resolveStop, reject) => {
+    const timeout = setTimeout(() => {
+      child.kill();
+      reject(new Error(`Application instance ${child.pid} did not stop.`));
+    }, 10_000);
+    child.once('error', (error) => {
+      clearTimeout(timeout);
+      reject(error);
+    });
+    child.once('close', () => {
+      clearTimeout(timeout);
+      resolveStop();
+    });
+    child.stdin?.end('shutdown\n');
+  });
+}
 
 function runProcessWorker(
   input: object,

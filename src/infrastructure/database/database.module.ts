@@ -10,6 +10,18 @@ import {
 
 export const DATABASE_ORM = Symbol('DATABASE_ORM');
 
+function databasePoolMax(environment: NodeJS.ProcessEnv): number {
+  const rawValue = environment.DATABASE_POOL_MAX;
+  if (rawValue === undefined) {
+    return 10;
+  }
+  const value = Number(rawValue);
+  if (!Number.isSafeInteger(value) || value < 1) {
+    throw new Error('DATABASE_POOL_MAX must be a positive integer.');
+  }
+  return value;
+}
+
 class DatabaseLifecycle implements OnApplicationShutdown {
   constructor(private readonly orm: MikroORM) {}
 
@@ -31,6 +43,7 @@ class DatabaseLifecycle implements OnApplicationShutdown {
         return MikroORM.init({
           clientUrl,
           ensureDatabase: false,
+          pool: { max: databasePoolMax(process.env) },
           entities: [
             WalletSchema,
             WagerTransactionSchema,

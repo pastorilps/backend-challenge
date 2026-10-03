@@ -137,6 +137,7 @@ Configuração local relevante:
 | `APP_PORT`                                                  | Porta HTTP publicada no host (padrão `3000`)                        |
 | `MINISTACK_PORT`                                            | Porta SQS publicada no host (padrão `4566`)                         |
 | `DATABASE_URL`                                              | URL de conexão interna; no Compose o hostname do banco é `postgres` |
+| `DATABASE_POOL_MAX`                                         | Máximo de conexões PostgreSQL por instância (padrão `10`)           |
 | `SQS_ENDPOINT_URL`                                          | Endpoint interno do emulador (`http://ministack:4566`)              |
 | `SQS_QUEUE_NAME` / `SQS_DLQ_NAME` / `SQS_EVENTS_QUEUE_NAME` | Nomes das filas FIFO inicializadas pelo Compose                     |
 | `AWS_REGION` / `AWS_ACCOUNT_ID`                             | Região e account id usados pelo MiniStack                           |
@@ -165,6 +166,11 @@ npm run test:e2e
 # Testes opt-in com PostgreSQL e MiniStack reais
 npm run test:integration
 
+# Exemplo: 200 requisições concorrentes em 5 instâncias da aplicação
+$env:TEST_MULTI_INSTANCE_REQUESTS = '200'
+$env:TEST_MULTI_INSTANCE_COUNT = '5'
+npm run test:report
+
 # Build, type-check e lint
 npm run build
 npx tsc --noEmit
@@ -182,6 +188,10 @@ Os testes PostgreSQL exigem um banco descartável **com as migrations já aplica
 O cenário fim a fim PostgreSQL + MiniStack verifica processamento de entrada por SQS, persistência em inbox/ledger/outbox, publicação dos eventos e encaminhamento de mensagem malformada para DLQ. Também encerra um processo de worker depois do commit financeiro e antes do ACK, reabre a conexão PostgreSQL e confirma que o redelivery é processado como replay sem duplicar efeitos. A suíte cobre ainda publishers concorrentes e retry de publicação contra MiniStack real, além de `REFUND` recebido antes de sua aposta de referência e posterior reconstrução do saldo pelo ledger.
 
 `npm run test:report` é o caminho recomendado para executar tudo. Ele sobe um projeto Docker Compose isolado (`backend-challenge-tests`, portas padrão `15432`, `14566` e `13000`), cria um banco separado (`backend_challenge_test_<sufixo aleatório>` por padrão) e filas FIFO exclusivas para aquela execução, inicializa o schema, roda unitários, e2e HTTP/Swagger e as duas suítes de integração. O resultado fica em `.test-results/report.html`, com saída detalhada por etapa e uma tabela separada dos riscos eliminatórios. O arquivo JSON bruto correspondente fica em `.test-results/results.json`. Se Docker ou os serviços reais não puderem ser preparados, a etapa aparece como `NOT RUN`, o relatório fica `INCOMPLETE` e o comando termina com código `2`; falhas de teste terminam com código `1`. A pasta de resultados é ignorada pelo Git.
+
+O teste HTTP de múltiplas instâncias aceita `TEST_MULTI_INSTANCE_REQUESTS` (requisições enviadas simultaneamente; padrão `50`), `TEST_MULTI_INSTANCE_COUNT` (processos Nest independentes; padrão `3`, mínimo `2`) e `TEST_MULTI_INSTANCE_POOL_MAX` (conexões PostgreSQL máximas por processo; padrão calculado para limitar a soma dos pools a 40 conexões). As requisições compartilham a mesma chave de idempotência para validar que apenas uma delas aplica o débito. Os valores usados aparecem no HTML e no JSON do relatório. No PowerShell, defina as variáveis antes de executar `npm run test:report` ou `npm run test:integration`; para restaurar os padrões na sessão atual, use `Remove-Item Env:TEST_MULTI_INSTANCE_REQUESTS, Env:TEST_MULTI_INSTANCE_COUNT, Env:TEST_MULTI_INSTANCE_POOL_MAX -ErrorAction SilentlyContinue`.
+
+`DATABASE_POOL_MAX` controla o limite de conexões por instância no serviço real, com padrão `10`. Dimensione-o considerando o total de instâncias (`instâncias × pool máximo`) e reserve conexões para migrations, workers e administração; o limite agregado deve caber no `max_connections` do PostgreSQL.
 
 O runner não apaga o banco ou volumes existentes, nem altera o projeto Compose de desenvolvimento. Os bancos e filas com nomes aleatórios são preservados para investigação/reexecução manual, não removidos automaticamente. `TEST_COMPOSE_PROJECT_NAME`, `TEST_COMPOSE_POSTGRES_PORT`, `TEST_COMPOSE_MINISTACK_PORT`, `TEST_COMPOSE_APP_PORT`, `TEST_DATABASE_NAME`, `TEST_SQS_QUEUE_NAME`, `TEST_SQS_DLQ_NAME` e `TEST_SQS_EVENTS_QUEUE_NAME` permitem escolher identificadores/portas isolados. Não configure o nome de um banco de desenvolvimento como `TEST_DATABASE_NAME`.
 

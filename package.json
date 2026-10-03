@@ -19,7 +19,7 @@
     "test:watch": "vitest",
     "test:cov": "vitest run --coverage",
     "test:debug": "vitest --inspect-brk --no-file-parallelism",
-    "test:integration": "vitest run src/infrastructure/database/mikro-orm/repositories/wager-transaction-concurrency.integration.spec.ts test/sqs-postgres.integration.spec.ts",
+    "test:integration": "npm run build && vitest run src/infrastructure/database/mikro-orm/repositories/wager-transaction-concurrency.integration.spec.ts test/sqs-postgres.integration.spec.ts",
     "test:e2e": "vitest run --config ./vitest.config.e2e.ts",
     "test:report": "node scripts/run-test-report.mjs",
     "migration:up": "mikro-orm migration:up --config ./mikro-orm.config.ts",
