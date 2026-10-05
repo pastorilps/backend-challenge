@@ -1,23 +1,23 @@
-FROM node:24-alpine AS build
+FROM oven/bun:1.4.2 AS build
 
 WORKDIR /app
 
-COPY package.json package-lock.json ./
-RUN npm ci
+COPY package.json bun.lock ./
+RUN bun install --frozen-lockfile
 
 COPY . .
-RUN npm run build
+RUN bun run build
 
-FROM node:24-alpine AS runtime
+FROM oven/bun:1.4.2 AS runtime
 
 ENV NODE_ENV=production
 WORKDIR /app
 
-COPY package.json package-lock.json ./
-RUN npm ci --omit=dev && npm cache clean --force
+COPY package.json bun.lock ./
+RUN bun install --frozen-lockfile --production
 
 COPY --from=build /app/dist ./dist
 
 EXPOSE 3000
 
-CMD ["npm", "run", "start:container"]
+CMD ["bun", "run", "start:container"]

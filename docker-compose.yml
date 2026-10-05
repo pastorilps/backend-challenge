@@ -24,6 +24,7 @@ services:
     restart: unless-stopped
     ports:
       - '${MINISTACK_PORT:-4566}:4566'
+      - '${APP_PORT:-3000}:3000'
     environment:
       LOG_LEVEL: ${MINISTACK_LOG_LEVEL:-INFO}
       MINISTACK_ACCOUNT_ID: ${AWS_ACCOUNT_ID:-000000000000}
@@ -69,10 +70,12 @@ services:
       SQS_RETRY_MAX_DELAY_MS: ${SQS_RETRY_MAX_DELAY_MS:-300000}
       SQS_VISIBILITY_TIMEOUT_SECONDS: ${SQS_VISIBILITY_TIMEOUT_SECONDS:-60}
       SQS_WAIT_TIME_SECONDS: ${SQS_WAIT_TIME_SECONDS:-20}
+      COGNITO_USER_POOL_ID: ${COGNITO_USER_POOL_ID:-}
+      COGNITO_ENDPOINT_URL: ${COGNITO_ENDPOINT_URL:-http://localhost:4566}
+      COGNITO_PROVIDER_CLIENTS: ${COGNITO_PROVIDER_CLIENTS:-}
       OUTBOX_BATCH_SIZE: ${OUTBOX_BATCH_SIZE:-10}
       OUTBOX_POLL_INTERVAL_MS: ${OUTBOX_POLL_INTERVAL_MS:-1000}
-    ports:
-      - '${APP_PORT:-3000}:3000'
+    network_mode: service:ministack
     depends_on:
       postgres:
         condition: service_healthy
@@ -82,7 +85,7 @@ services:
       test:
         [
           'CMD',
-          'node',
+          'bun',
           '-e',
           "fetch('http://127.0.0.1:3000/health/ready').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))",
         ]
@@ -90,8 +93,6 @@ services:
       timeout: 5s
       retries: 5
       start_period: 30s
-    networks:
-      - app_network
 
 volumes:
   postgres_data:

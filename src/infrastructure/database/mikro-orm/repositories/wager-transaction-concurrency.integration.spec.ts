@@ -222,7 +222,7 @@ integration('PostgreSQL wager transaction concurrency', () => {
     expect(inboxCount).toBe(1);
   }, 30_000);
 
-  it('keeps a wager idempotent across three real Node.js processes', async () => {
+  it('keeps a wager idempotent across three real Bun processes', async () => {
     const walletId = await createWallet('100.00');
     const wallet = await ormInstances[0].em
       .fork()

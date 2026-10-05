@@ -262,7 +262,7 @@ async function initializeDockerIntegration() {
       '-e',
       `DATABASE_URL=${internalDatabaseUrl}`,
       'app',
-      'npm',
+      'bun',
       'run',
       'db:initialize',
     ]))
@@ -294,7 +294,7 @@ async function initializeDockerIntegration() {
       '-e',
       'SQS_WAIT_TIME_SECONDS=1',
       'app',
-      'npm',
+      'bun',
       'run',
       'sqs:initialize',
     ]))
@@ -410,7 +410,7 @@ function renderReport() {
     [
       'Idempotência apenas em memória',
       statusForEvidence('PostgreSQL and multi-process integration'),
-      'A persistência é verificada no PostgreSQL, inclusive por testes com três processos Node concorrentes.',
+      'A persistência é verificada no PostgreSQL, inclusive por testes com três processos Bun concorrentes.',
     ],
     [
       'Correção limitada a uma instância',
@@ -614,7 +614,7 @@ async function main() {
 
   const buildPassed = await run(
     'Build production application for multi-instance tests',
-    process.platform === 'win32' ? 'npm.cmd' : 'npm',
+    process.execPath,
     ['run', 'build'],
   );
 

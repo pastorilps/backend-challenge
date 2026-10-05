@@ -18,6 +18,7 @@ import {
   ApiOkResponse,
   ApiOperation,
   ApiTags,
+  ApiBearerAuth,
 } from '@nestjs/swagger';
 import { CreateWalletUseCase } from '../../../application/wallets/create-wallet/create-wallet.use-case.js';
 import { GetWalletLedgerUseCase } from '../../../application/wallets/get-wallet/get-wallet-ledger.use-case.js';
@@ -36,6 +37,7 @@ import {
 } from './dto/wallet-responses.dto.js';
 
 @ApiTags('wallets')
+@ApiBearerAuth('cognito-jwt')
 @UseGuards(ProviderIdentityGuard)
 @Controller('wallets')
 export class WalletsController {

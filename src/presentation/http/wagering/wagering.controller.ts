@@ -6,6 +6,7 @@ import {
   HttpStatus,
   Param,
   Post,
+  Req,
   Res,
   UseGuards,
 } from '@nestjs/common';
@@ -20,8 +21,9 @@ import {
   ApiServiceUnavailableResponse,
   ApiTags,
   ApiUnprocessableEntityResponse,
+  ApiBearerAuth,
 } from '@nestjs/swagger';
-import type { Response } from 'express';
+import type { Request, Response } from 'express';
 import { GetWagerTransactionUseCase } from '../../../application/wagering/get-wager-transaction/get-wager-transaction.use-case.js';
 import { ProcessWagerTransactionUseCase } from '../../../application/wagering/process-wager-transaction/process-wager-transaction.use-case.js';
 import { AppError } from '../../../shared/errors/app.error.js';
@@ -38,6 +40,7 @@ import {
 } from './dto/wager-transaction-response.dto.js';
 
 @ApiTags('wagering')
+@ApiBearerAuth('cognito-jwt')
 @UseGuards(ProviderIdentityGuard)
 @Controller()
 export class WageringController {
@@ -105,8 +108,21 @@ export class WageringController {
     description: 'Transaction found.',
     type: WagerTransactionDetailsResponseDto,
   })
-  getById(@Param() params: WagerTransactionIdParamsDto) {
-    return this.getWagerTransaction.byId(params.transactionId);
+  async getById(
+    @Param() params: WagerTransactionIdParamsDto,
+    @Req() request: Request & { auth?: { providerId: string } },
+  ) {
+    const transaction = await this.getWagerTransaction.byId(
+      params.transactionId,
+    );
+    if (transaction.providerId !== request.auth?.providerId) {
+      throw new AppError(
+        'Wager transaction was not found.',
+        'WAGER_TRANSACTION_NOT_FOUND',
+        404,
+      );
+    }
+    return transaction;
   }
 
   @Get('providers/:providerId/wagering/transactions/:externalTransactionId')
@@ -115,17 +131,31 @@ export class WageringController {
   })
   @ApiParam({
     name: 'providerId',
-    schema: { type: 'string', maxLength: 100 },
+    schema: { type: 'string', maxLength: 100, example: 'provider-a' },
   })
   @ApiParam({
     name: 'externalTransactionId',
-    schema: { type: 'string', maxLength: 255 },
+    schema: {
+      type: 'string',
+      maxLength: 255,
+      example: 'transaction-143',
+    },
   })
   @ApiOkResponse({
     description: 'Transaction found.',
     type: WagerTransactionDetailsResponseDto,
   })
-  getByProviderExternalId(@Param() params: ProviderTransactionParamsDto) {
+  getByProviderExternalId(
+    @Param() params: ProviderTransactionParamsDto,
+    @Req() request: Request & { auth?: { providerId: string } },
+  ) {
+    if (params.providerId !== request.auth?.providerId) {
+      throw new AppError(
+        'Wager transaction was not found.',
+        'WAGER_TRANSACTION_NOT_FOUND',
+        404,
+      );
+    }
     return this.getWagerTransaction.byProviderExternalId(
       params.providerId,
       params.externalTransactionId,

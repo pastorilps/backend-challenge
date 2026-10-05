@@ -1,6 +1,10 @@
 {
   "name": "backend-challenge",
   "version": "0.0.1",
+  "packageManager": "bun@1.4.2",
+  "engines": {
+    "bun": ">=1.0.0"
+  },
   "description": "",
   "author": "",
   "private": true,
@@ -13,21 +17,22 @@
     "start": "nest start",
     "start:dev": "nest start --watch",
     "start:debug": "nest start --debug --watch",
-    "start:prod": "node dist/main",
+    "start:prod": "bun dist/main.js",
     "lint": "oxlint --type-aware src/ test/",
     "test": "vitest run",
     "test:watch": "vitest",
     "test:cov": "vitest run --coverage",
     "test:debug": "vitest --inspect-brk --no-file-parallelism",
-    "test:integration": "npm run build && vitest run src/infrastructure/database/mikro-orm/repositories/wager-transaction-concurrency.integration.spec.ts test/sqs-postgres.integration.spec.ts",
+    "test:integration": "bun run build && vitest run src/infrastructure/database/mikro-orm/repositories/wager-transaction-concurrency.integration.spec.ts test/sqs-postgres.integration.spec.ts",
     "test:e2e": "vitest run --config ./vitest.config.e2e.ts",
-    "test:report": "node scripts/run-test-report.mjs",
+    "test:report": "bun scripts/run-test-report.mjs",
     "migration:up": "mikro-orm migration:up --config ./mikro-orm.config.ts",
-    "db:initialize": "node dist/infrastructure/database/mikro-orm/run-migrations.js",
-    "sqs:initialize": "node dist/infrastructure/messaging/sqs/initialize-sqs.js",
-    "start:container": "npm run sqs:initialize && node dist/infrastructure/database/mikro-orm/run-migrations.js && node dist/main.js"
+    "db:initialize": "bun dist/infrastructure/database/mikro-orm/run-migrations.js",
+    "sqs:initialize": "bun dist/infrastructure/messaging/sqs/initialize-sqs.js",
+    "start:container": "bun run sqs:initialize && bun run db:initialize && bun dist/main.js"
   },
   "dependencies": {
+    "@aws-sdk/client-cognito-identity-provider": "^3.1146.0",
     "@aws-sdk/client-sqs": "^3.1146.0",
     "@mikro-orm/migrations": "^7.2.3",
     "@mikro-orm/postgresql": "^7.2.3",
@@ -39,6 +44,7 @@
     "class-transformer": "^0.5.1",
     "class-validator": "^0.15.1",
     "dotenv": "^18.0.5",
+    "jose": "^6.2.12",
     "reflect-metadata": "^0.2.2",
     "rxjs": "^7.8.1"
   },

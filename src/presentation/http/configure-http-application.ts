@@ -35,6 +35,10 @@ export function configureHttpApplication(app: INestApplication): void {
       'HTTP API for wallets and idempotent wager transaction processing.',
     )
     .setVersion('1.0.0')
+    .addBearerAuth(
+      { type: 'http', scheme: 'bearer', bearerFormat: 'JWT' },
+      'cognito-jwt',
+    )
     .build();
   const swaggerDocument = SwaggerModule.createDocument(app, swaggerConfig);
   SwaggerModule.setup('docs', app, swaggerDocument);

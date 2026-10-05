@@ -17,6 +17,8 @@ import { HealthController } from './presentation/http/health/health.controller.j
 import { WageringController } from './presentation/http/wagering/wagering.controller.js';
 import { WalletsController } from './presentation/http/wallets/wallets.controller.js';
 import { ProviderIdentityGuard } from './presentation/http/auth/provider-identity.guard.js';
+import { loadCognitoAuthConfig } from './presentation/http/auth/cognito-auth.config.js';
+import { CognitoTokenVerifier } from './presentation/http/auth/cognito-token-verifier.js';
 import { AppMetrics } from './infrastructure/observability/metrics/app-metrics.js';
 import {
   SQS_QUEUE_CLIENT,
@@ -48,7 +50,16 @@ export const { ObserveModule, ObserveInstrument } = createObserveModule();
   ],
   controllers: [WalletsController, WageringController, HealthController],
   providers: [
-    ProviderIdentityGuard,
+    {
+      provide: CognitoTokenVerifier,
+      useFactory: () => new CognitoTokenVerifier(loadCognitoAuthConfig),
+    },
+    {
+      provide: ProviderIdentityGuard,
+      useFactory: (tokenVerifier: CognitoTokenVerifier) =>
+        new ProviderIdentityGuard(tokenVerifier),
+      inject: [CognitoTokenVerifier],
+    },
     {
       provide: CreateWalletUseCase,
       useFactory: (orm: MikroORM) => new CreateWalletUseCase(orm),

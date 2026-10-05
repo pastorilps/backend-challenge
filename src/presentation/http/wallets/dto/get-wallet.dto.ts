@@ -17,11 +17,17 @@ export class WalletLedgerQueryDto {
   @IsString()
   cursor?: string;
 
-  @ApiProperty({ required: false, minimum: 1, maximum: 100, default: 50 })
+  @ApiProperty({
+    type: Number,
+    required: false,
+    minimum: 1,
+    maximum: 100,
+    default: 50,
+  })
   @IsOptional()
   @Type(() => Number)
   @IsInt()
   @Min(1)
   @Max(100)
-  limit = 50;
+  limit: number = 50;
 }

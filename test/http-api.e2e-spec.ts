@@ -20,6 +20,8 @@ import { ProviderIdentityGuard } from '../src/presentation/http/auth/provider-id
 describe('HTTP API (e2e)', () => {
   let app: INestApplication<App>;
   let processTransaction: ReturnType<typeof vi.fn>;
+  let getWalletLedger: ReturnType<typeof vi.fn>;
+  let getTransactionByProviderExternalId: ReturnType<typeof vi.fn>;
   let previousSqsHealthUrl: string | undefined;
 
   beforeEach(async () => {
@@ -34,10 +36,14 @@ describe('HTTP API (e2e)', () => {
       },
       replayed: false,
     });
+    getWalletLedger = vi.fn().mockResolvedValue({ entries: [] });
+    getTransactionByProviderExternalId = vi.fn().mockResolvedValue({
+      providerId: 'provider-a',
+      externalTransactionId: 'transaction-143',
+    });
     const module = await Test.createTestingModule({
       controllers: [WalletsController, WageringController, HealthController],
       providers: [
-        ProviderIdentityGuard,
         {
           provide: CreateWalletUseCase,
           useValue: {
@@ -55,7 +61,7 @@ describe('HTTP API (e2e)', () => {
         },
         {
           provide: GetWalletLedgerUseCase,
-          useValue: { execute: vi.fn().mockResolvedValue({ entries: [] }) },
+          useValue: { execute: getWalletLedger },
         },
         {
           provide: ReconcileWalletUseCase,
@@ -71,9 +77,7 @@ describe('HTTP API (e2e)', () => {
           provide: GetWagerTransactionUseCase,
           useValue: {
             byId: vi.fn().mockResolvedValue({ transactionId: 'transaction' }),
-            byProviderExternalId: vi
-              .fn()
-              .mockResolvedValue({ transactionId: 'transaction' }),
+            byProviderExternalId: getTransactionByProviderExternalId,
           },
         },
         {
@@ -87,7 +91,21 @@ describe('HTTP API (e2e)', () => {
           },
         },
       ],
-    }).compile();
+    })
+      .overrideGuard(ProviderIdentityGuard)
+      .useValue({
+        canActivate: (context: {
+          switchToHttp: () => {
+            getRequest: () => Request & { auth?: { providerId: string } };
+          };
+        }) => {
+          context.switchToHttp().getRequest().auth = {
+            providerId: 'provider-a',
+          };
+          return true;
+        },
+      })
+      .compile();
 
     app = module.createNestApplication();
     configureHttpApplication(app);
@@ -122,9 +140,81 @@ describe('HTTP API (e2e)', () => {
       '/providers/{providerId}/wagering/transactions/{externalTransactionId}',
     );
     expect(result.body.paths).toHaveProperty('/health/live');
+    expect(result.body.components.securitySchemes['cognito-jwt']).toMatchObject(
+      {
+        type: 'http',
+        scheme: 'bearer',
+        bearerFormat: 'JWT',
+      },
+    );
+    expect(result.body.paths['/wagering/transactions'].post.security).toEqual([
+      { 'cognito-jwt': [] },
+    ]);
     expect(
       result.body.components.schemas.CreateWagerTransactionDto.properties,
     ).not.toHaveProperty('referenceExternalTransactionId');
+    expect(
+      result.body.paths['/wallets/{walletId}/ledger'].get.parameters.find(
+        (parameter: { name: string }) => parameter.name === 'limit',
+      ).schema,
+    ).toMatchObject({ type: 'number', default: 50, minimum: 1, maximum: 100 });
+    expect(
+      result.body.paths[
+        '/providers/{providerId}/wagering/transactions/{externalTransactionId}'
+      ].get.parameters,
+    ).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          name: 'providerId',
+          schema: expect.objectContaining({ example: 'provider-a' }),
+        }),
+        expect.objectContaining({
+          name: 'externalTransactionId',
+          schema: expect.objectContaining({ example: 'transaction-143' }),
+        }),
+      ]),
+    );
+  });
+
+  it('passes numeric ledger pagination parameters to the use case', async () => {
+    await request(app.getHttpServer())
+      .get(
+        '/wallets/00000000-0000-4000-8000-000000000002/ledger?limit=25',
+      )
+      .expect(200);
+
+    expect(getWalletLedger).toHaveBeenCalledWith(
+      '00000000-0000-4000-8000-000000000002',
+      25,
+      undefined,
+    );
+  });
+
+  it('looks up a wager by provider and external transaction ID', async () => {
+    const result = await request(app.getHttpServer())
+      .get(
+        '/providers/provider-a/wagering/transactions/transaction-143',
+      )
+      .expect(200);
+
+    expect(result.body).toMatchObject({
+      providerId: 'provider-a',
+      externalTransactionId: 'transaction-143',
+    });
+    expect(getTransactionByProviderExternalId).toHaveBeenCalledWith(
+      'provider-a',
+      'transaction-143',
+    );
+  });
+
+  it('does not allow looking up another provider transaction', async () => {
+    await request(app.getHttpServer())
+      .get(
+        '/providers/provider-b/wagering/transactions/transaction-143',
+      )
+      .expect(404);
+
+    expect(getTransactionByProviderExternalId).not.toHaveBeenCalled();
   });
 
   it('requires an idempotency key and returns a structured client error', async () => {
